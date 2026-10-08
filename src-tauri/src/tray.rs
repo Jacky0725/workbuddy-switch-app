@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     fn taskbar_theme_is_readable_on_windows() {
         assert!(
-            taskbar_uses_light_theme().is_some(),
+            super::taskbar_uses_light_theme().is_some(),
             "读不到 SystemUsesLightTheme：自适应不可用，应改为固定素材"
         );
     }
