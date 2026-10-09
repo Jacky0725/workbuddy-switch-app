@@ -189,6 +189,9 @@ pub fn sync_pair(
     mode: &str,
     restart: bool,
 ) -> Result<Value, String> {
+    if client == SessionClient::Workbuddy {
+        crate::modules::session_safety::require_verified_client()?;
+    }
     let context = resolve_pair(client, scope, group_id, source_member_id, target_member_id)?;
     if preview_token.trim().is_empty() {
         return Err("缺少会话同步预览凭据".to_string());
@@ -225,6 +228,9 @@ pub fn sync_unify_batch(
     targets: &[GroupUnifyTarget],
     restart: bool,
 ) -> Result<Value, String> {
+    if client == SessionClient::Workbuddy {
+        crate::modules::session_safety::require_verified_client()?;
+    }
     match client {
         SessionClient::Workbuddy => {
             sync_unify_batch_workbuddy(scope, group_id, source_member_id, targets)
@@ -438,6 +444,9 @@ pub fn sync_safe_batch(
     group_id: &str,
     restart: bool,
 ) -> Result<Value, String> {
+    if client == SessionClient::Workbuddy {
+        crate::modules::session_safety::require_verified_client()?;
+    }
     let detail = detail(client, scope, group_id)?;
     let source_member_id = detail
         .get("safeSourceMemberId")
@@ -543,6 +552,9 @@ pub fn add_member(
     target_account_id: &str,
     restart: bool,
 ) -> Result<Value, String> {
+    if client == SessionClient::Workbuddy {
+        crate::modules::session_safety::require_verified_client()?;
+    }
     client.validate_scope(scope)?;
     let paths = client.store_paths();
     let accounts = account::load_accounts_at(&account::accounts_file_in(&paths.store_root));

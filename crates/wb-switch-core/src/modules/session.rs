@@ -215,7 +215,7 @@ pub(crate) fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
     let conn = if read_only {
         Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?
     } else {
-        Connection::open(path).ok()?
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).ok()?
     };
     let _ = conn.busy_timeout(Duration::from_secs(5));
     Some(conn)
@@ -303,30 +303,18 @@ pub fn session_copy_supported_at(root: &Path) -> bool {
 /// 档位不支持会话复制时的统一错误文案。
 pub const SESSION_COPY_UNSUPPORTED: &str = "该档位暂不支持会话复制";
 
-/// 目标账号是当前登录账号、且 WorkBuddy 正在运行时的统一错误文案。
-///
-/// 写"非当前登录账号"的副本实测免关安全（`research/verification-app-running-write.md`
-/// 探针 5）：客户端不使用该账号的数据、切号后自然可见；写"当前登录账号"仍必须等
-/// App 停止写入——运行实例看不到写入，继续对话会让会话状态分叉。
+/// Shared SQLite/JSONL storage may be written by the client regardless of the target owner.
 pub const SESSION_COPY_APP_RUNNING: &str =
-    "目标账号正在 WorkBuddy 中使用，已阻止修改会话数据；请先退出 WorkBuddy 后重试";
+    "WorkBuddy 正在运行，已阻止修改共享会话数据；请先退出 WorkBuddy 后重试";
 
-/// 目标档客户端运行时的写入门禁：仅当目标账号是该档位**当前登录账号**时拦截。
-///
-/// 无法读取登录态时保守拦截（宁可要求退出，不做无法判定的写入）。
+/// Block all writes to a running target variant, including a non-current account.
 fn app_running_blocks_target_write(
-    paths: &SessionPaths,
+    _paths: &SessionPaths,
     variant: WbVariant,
-    target_uid: &str,
+    _target_uid: &str,
     is_app_running: &impl Fn(WbVariant) -> bool,
 ) -> bool {
-    if !is_app_running(variant) {
-        return false;
-    }
-    match current_user_uid_at(&paths.auth_file) {
-        Some(current) => current == target_uid,
-        None => true,
-    }
+    is_app_running(variant)
 }
 
 /// 操作日志无法解析时的原因前缀（恢复与复制共用，避免漏报后写出第二个副本）。
@@ -513,7 +501,7 @@ pub(crate) fn find_project_jsonl(paths: &SessionPaths, cid: &str) -> Option<Path
     None
 }
 
-/// 备份 workbuddy.db（含 -wal/-shm），返回主库备份路径。
+/// Create one independently readable SQLite snapshot, including committed WAL data.
 ///
 /// 任何一步失败都返回 Err——不能沿用「忽略 copy 错误后仍宣称备份成功」的旧行为，
 /// 备份不可信时后续数据库写入必须先停下来（design §1）。
@@ -523,22 +511,10 @@ fn backup_workbuddy_db(paths: &SessionPaths, backup_root: &Path) -> Result<PathB
         return Err("会话数据不存在，未复制".to_string());
     }
     std::fs::create_dir_all(backup_root).map_err(|error| format!("备份目录创建失败：{error}"))?;
-    for suffix in ["", "-wal", "-shm"] {
-        let src = PathBuf::from(format!("{}{}", db.to_string_lossy(), suffix));
-        if !src.is_file() {
-            continue;
-        }
-        let dest = backup_root.join(format!("workbuddy.db{suffix}"));
-        std::fs::copy(&src, &dest).map_err(|error| format!("备份 {suffix} 失败：{error}"))?;
-        let (src_len, dest_len) = (
-            std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0),
-            std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0),
-        );
-        if src_len != dest_len {
-            return Err(format!("备份 {suffix} 校验失败：大小不一致，未复制"));
-        }
-    }
-    Ok(backup_root.join("workbuddy.db"))
+    let snapshot = backup_root.join("workbuddy.db");
+    snapshot_workbuddy_db(&db, &snapshot)?;
+    session_backup::sync_file(&snapshot).map_err(|_| "数据库快照无法持久保存".to_string())?;
+    Ok(snapshot)
 }
 
 /// 数据库插入结果：`No*` 与 `SourceRowMissing` 都不允许被当成成功。
@@ -582,10 +558,8 @@ fn insert_session_copy(
         return Ok(DbCopyOutcome::NoDb);
     }
     let src_db = source_paths.workbuddy_db();
-    let same_db = src_db == dst_db;
     let source_row = if src_db.is_file() {
-        // 同档沿用读写连接（与改造前一致）；跨档对源档只读，不触碰源档 WAL 恢复。
-        let Some(conn) = open_db(&src_db, !same_db) else {
+        let Some(conn) = open_db(&src_db, true) else {
             return Err("会话数据无法打开".to_string());
         };
         if !table_exists(&conn, "sessions") {
@@ -599,14 +573,14 @@ fn insert_session_copy(
         return Ok(DbCopyOutcome::SourceRowMissing);
     };
 
-    let Some(conn) = open_db(&dst_db, false) else {
+    let Some(mut conn) = open_db(&dst_db, false) else {
         return Err("会话数据无法打开".to_string());
     };
     if !table_exists(&conn, "sessions") {
         return Ok(DbCopyOutcome::NoSessionsTable);
     }
     // 写事务的提交必须可靠持久：在本次实际写连接上确认 synchronous ≥ FULL。
-    session_backup::ensure_full_synchronous(&conn)?;
+    session_backup::prepare_write_connection(&conn)?;
     let target_cols = session_table_columns(&conn)?;
 
     let mut cols: Vec<String> = Vec::with_capacity(target_cols.len());
@@ -635,12 +609,21 @@ fn insert_session_copy(
     }
 
     let placeholders = cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    let colnames = cols.join(", ");
+    let colnames = cols
+        .iter()
+        .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
     // 用 INSERT 而不是 INSERT OR REPLACE：新 UUID 撞库时宁可失败，也不能悄悄覆盖既有会话。
     let sql = format!("INSERT INTO sessions ({colnames}) VALUES ({placeholders})");
     let params: Vec<&rusqlite::types::Value> = vals.iter().collect();
-    conn.execute(&sql, rusqlite::params_from_iter(params))
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|_| "数据库正在被占用，已停止复制".to_string())?;
+    tx.execute(&sql, rusqlite::params_from_iter(params))
         .map_err(|e| format!("会话记录保存失败：{e}"))?;
+    session_backup::verify_database_integrity(&tx)?;
+    tx.commit().map_err(|_| "会话记录提交失败".to_string())?;
     Ok(DbCopyOutcome::Inserted)
 }
 
@@ -702,6 +685,7 @@ pub fn copy_sessions_for_switch(
     target_acc: &Value,
     session_ids: &[String],
 ) -> Result<Value, String> {
+    crate::modules::session_safety::require_verified_client()?;
     let variant = account::variant_of(target_acc);
     let paths = SessionPaths::for_variant(variant);
     copy_sessions_for_switch_at(
@@ -723,6 +707,7 @@ pub fn copy_sessions_cross(
     target_acc: &Value,
     session_ids: &[String],
 ) -> Result<Value, String> {
+    crate::modules::session_safety::require_verified_client()?;
     let source_variant = account::variant_of(source_acc);
     let target_variant = account::variant_of(target_acc);
     let source_paths = SessionPaths::for_variant(source_variant);
@@ -776,7 +761,7 @@ fn copy_sessions_cross_at(
     resolve_source_paths: impl Fn(WbVariant) -> SessionPaths,
 ) -> Result<Value, String> {
     // 快拒只针对**目标档**（写侧）：源档只读，运行中的源客户端不影响读取安全；
-    // 目标账号不是当前登录账号时免关直接写（实测，见门禁函数注释）。
+    // 目标档运行中时拒绝所有账号的共享数据库写入。
     if app_running_blocks_target_write(target.paths, target.variant, &target.uid, &is_app_running) {
         return Err(SESSION_COPY_APP_RUNNING.to_string());
     }
@@ -819,8 +804,7 @@ fn copy_sessions_for_switch_at(
     if source_uid == target_uid {
         return Err("当前账号与目标账号相同，无需复制会话".to_string());
     }
-    // 同档路径的源恒为当前登录账号、且上面已拦同账号，因此这里对"目标=当前登录"
-    // 恒为放行；保留统一门禁只为与其他写入入口共用同一条规则。
+    // 共享数据库写入必须等待目标档客户端关闭。
     if app_running_blocks_target_write(paths, variant, &target_uid, &is_app_running) {
         return Err(SESSION_COPY_APP_RUNNING.to_string());
     }
@@ -1214,6 +1198,9 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
             group_id: resolution.group_id.unwrap_or_default(),
         });
     }
+
+    crate::modules::session_safety::preflight_target_database(paths)?;
+    crate::modules::session_safety::validate_body_path(context.source_paths, &source_path)?;
 
     // 预分配身份：维护记录（allocating）先于任何备份与业务写入（design §3）。
     // 任何副本写入之前，生命周期身份必须已可靠落盘，恢复/补清理才有依据。
@@ -2260,6 +2247,7 @@ pub fn sync_sessions_for_switch(
     target_acc: &Value,
     selections: &[SyncSelection],
 ) -> Result<Value, String> {
+    crate::modules::session_safety::require_verified_client()?;
     let variant = account::variant_of(target_acc);
     let paths = SessionPaths::for_variant(variant);
     sync_sessions_for_switch_at(
@@ -2316,7 +2304,7 @@ fn sync_sessions_for_switch_at(
     if source_uid == target_uid {
         return Err("当前账号与目标账号相同，无需同步会话".to_string());
     }
-    // 与复制同一条门禁：同档路径的源恒为当前登录账号，这里恒为放行（统一规则）。
+    // 与复制共用共享数据库运行门禁。
     if app_running_blocks_target_write(paths, variant, &target_uid, &is_app_running) {
         return Err(SESSION_COPY_APP_RUNNING.to_string());
     }
@@ -2421,6 +2409,7 @@ pub fn sync_sessions_cross(
     target_acc: &Value,
     selections: &[SyncSelection],
 ) -> Result<Value, String> {
+    crate::modules::session_safety::require_verified_client()?;
     let source_variant = account::variant_of(source_acc);
     let target_variant = account::variant_of(target_acc);
     let source_paths = SessionPaths::for_variant(source_variant);
@@ -2479,8 +2468,7 @@ fn sync_sessions_cross_at(
     if selections.is_empty() {
         return Ok(json!({ "synced": synced, "skipped": skipped, "errors": errors }));
     }
-    // 与复制同一条门禁：仅当目标账号是目标档当前登录账号时才要求关闭客户端
-    // （源档只读，运行中的源客户端不影响读取安全）。
+    // 目标档客户端运行时拒绝所有账号的写入。
     if app_running_blocks_target_write(target.paths, target.variant, &target.uid, &is_app_running) {
         return Err(SESSION_COPY_APP_RUNNING.to_string());
     }
@@ -2742,9 +2730,8 @@ fn snapshot_workbuddy_db(source: &Path, dest: &Path) -> Result<(), String> {
     if dest.exists() {
         return Err("备份数据库已存在同名文件，未覆盖".to_string());
     }
-    // 源连接用读写打开：WAL 库在缺 -shm 时无法只读打开，而备份是写入门禁，
-    // 不能因此失败。App 已关闭且持有档位锁，读写打开不会改动会话内容。
-    let src = open_db(source, false).ok_or_else(|| "会话数据无法打开，未同步".to_string())?;
+    // Fail closed if a source cannot be read without a read/write recovery connection.
+    let src = open_db(source, true).ok_or_else(|| "会话数据无法只读打开，未同步".to_string())?;
     {
         let mut dst =
             Connection::open(dest).map_err(|error| format!("备份数据库创建失败：{error}"))?;
@@ -2764,6 +2751,15 @@ fn snapshot_workbuddy_db(source: &Path, dest: &Path) -> Result<(), String> {
                 Err(error) => return Err(format!("数据库快照失败：{error}")),
             }
         }
+        drop(backup);
+        // The backup copies the source header, including WAL mode. Convert only the
+        // isolated destination to a single-file snapshot before verification/recovery.
+        let mode: String = dst
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .map_err(|_| "数据库快照无法转为独立文件".to_string())?;
+        if mode != "delete" {
+            return Err("数据库快照仍依赖 WAL，已停止写入".into());
+        }
     }
     verify_db_snapshot(dest)
 }
@@ -2772,12 +2768,8 @@ fn snapshot_workbuddy_db(source: &Path, dest: &Path) -> Result<(), String> {
 fn verify_db_snapshot(path: &Path) -> Result<(), String> {
     let conn =
         open_db(path, true).ok_or_else(|| "备份数据库无法回读，未按备份成功处理".to_string())?;
-    let check: String = conn
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(|error| format!("备份数据库完整性校验失败：{error}"))?;
-    if check != "ok" {
-        return Err(format!("备份数据库完整性校验未通过：{check}"));
-    }
+    session_backup::verify_database_integrity(&conn)?;
+    crate::modules::session_safety::validate_session_schema(&conn)?;
     if !table_exists(&conn, "sessions") {
         return Err("备份数据库缺少数据表，未按备份成功处理".to_string());
     }
@@ -2857,6 +2849,8 @@ fn verify_sync_backup(dir: &Path, manifest: &SyncBackupManifest) -> Result<(), S
     }
     let conn =
         open_db(&snapshot, true).ok_or_else(|| "数据库快照无法打开，已停止恢复".to_string())?;
+    session_backup::verify_database_integrity(&conn)?;
+    crate::modules::session_safety::validate_session_schema(&conn)?;
     if !table_exists(&conn, "sessions") {
         return Err("数据库快照缺少数据表，已停止恢复".to_string());
     }
@@ -2878,6 +2872,7 @@ fn validated_target_body_path(
     if !path.starts_with(paths.projects_dir()) || !name_matches {
         return Err("备份清单记录的目标内容路径不合法，已停止保存".to_string());
     }
+    crate::modules::session_safety::validate_body_path(paths, &path)?;
     Ok(path)
 }
 
@@ -3091,9 +3086,9 @@ fn update_target_session_row(
         return Err("会话数据缺少数据表，未同步".to_string());
     }
     // 写事务的提交必须可靠持久：在本次实际写连接上确认 synchronous ≥ FULL。
-    session_backup::ensure_full_synchronous(&conn)?;
+    session_backup::prepare_write_connection(&conn)?;
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("会话数据事务开启失败：{error}"))?;
     let affected = tx
         .execute(
@@ -3126,6 +3121,7 @@ fn update_target_session_row(
         }
         (Some(_), None) => {}
     }
+    session_backup::verify_database_integrity(&tx)?;
     tx.commit()
         .map_err(|error| format!("会话数据提交失败：{error}"))?;
     Ok(())
@@ -3328,6 +3324,8 @@ fn execute_sync_item(
     }
     let target_body_path = find_project_jsonl(paths, &plan.target_member.session_id)
         .ok_or_else(|| "目标内容不存在，未同步".to_string())?;
+    crate::modules::session_safety::preflight_target_database(paths)?;
+    crate::modules::session_safety::validate_body_path(paths, &target_body_path)?;
     let new_updated_at = now_ms();
     let last_synced_at = now_ms();
     let new_baseline_ref = uuid::Uuid::new_v4().to_string();
@@ -3523,12 +3521,9 @@ where
 /// 生产入口：自行获取档位操作锁后恢复（被占用时返回明确错误，不排队）。
 pub fn recover_pending_session_operations(variant: WbVariant) -> Result<RecoveryReport, String> {
     let paths = SessionPaths::for_variant(variant);
-    let _lock = session_link::try_acquire_variant_ops_lock(&paths, variant)?;
-    Ok(recover_pending_session_operations_at_with(
-        &paths,
-        variant,
-        SessionPaths::for_variant,
-    ))
+    crate::modules::session_safety::preflight_switch(&paths, variant, false)?;
+    // No writes/cleanup are allowed until the production compatibility gate is opened.
+    Ok(RecoveryReport::default())
 }
 
 enum RecoverOutcome {
@@ -5325,47 +5320,47 @@ mod tests {
         assert_eq!(report["copied"].as_array().unwrap().len(), 1);
     }
 
-    /// 目标账号不是当前登录账号（auth=uid-a）时，App 运行中不再拦截写入（S5 实测口径）；
-    /// 快拒与锁后复查仍各执行一次，且复查必须发生在持锁之后、写入之前。
     #[test]
-    fn copy_runs_while_app_running_for_non_current_account() {
-        let env = ready_env("app-running-non-current");
-        let probes = std::cell::Cell::new(0usize);
-        let lock_held_on_recheck = std::cell::Cell::new(false);
-        let lock_path = env.paths.variant_ops_lock_file(WbVariant::Cn);
-        let probe = |_: WbVariant| {
-            let n = probes.get() + 1;
-            probes.set(n);
-            if n == 1 {
-                true
-            } else {
-                // 第二次必须发生在持锁之后：此时再抢同一把锁应为 Busy。
-                match session_link::try_lock_file(&lock_path) {
-                    Err(session_link::LockError::Busy) => lock_held_on_recheck.set(true),
-                    Err(session_link::LockError::Unavailable(reason)) => {
-                        panic!("第二次探针时期望档位锁已被持有，实际 Unavailable: {reason}")
-                    }
-                    Ok(_) => panic!("第二次探针时期望档位锁已被持有，实际拿到了锁"),
-                }
-                true
-            }
-        };
-        let report = copy_sessions_for_switch_at(
+    fn copy_blocks_running_shared_database_and_rechecks_under_lock() {
+        let env = ready_env("app-running-shared");
+        let before = std::fs::read(env.paths.workbuddy_db()).unwrap();
+        let err = copy_sessions_for_switch_at(
             &env.paths(),
             WbVariant::Cn,
             &env.target("uid-b"),
-            &["sess-1".to_string()],
-            probe,
+            &["sess-1".into()],
+            |_| true,
         )
-        .expect("目标非当前登录账号：运行中必须放行");
-        assert_eq!(report["copied"].as_array().unwrap().len(), 1);
-        assert_eq!(probes.get(), 2, "快拒与锁后复查各检查一次");
-        assert!(
-            lock_held_on_recheck.get(),
-            "复查必须发生在已经拿到档位锁之后、任何写入之前"
-        );
-        assert_eq!(env.rows_for("uid-b").len(), 1, "副本行已写入");
-        assert!(env.paths.session_links_file().exists(), "关联记录已建立");
+        .unwrap_err();
+        assert_eq!(err, SESSION_COPY_APP_RUNNING);
+        assert_eq!(std::fs::read(env.paths.workbuddy_db()).unwrap(), before);
+        assert_eq!(env.body_files().len(), 1);
+        assert!(!env.paths.session_links_file().exists());
+
+        let probes = std::cell::Cell::new(0usize);
+        let lock_path = env.paths.variant_ops_lock_file(WbVariant::Cn);
+        let err = copy_sessions_for_switch_at(
+            &env.paths(),
+            WbVariant::Cn,
+            &env.target("uid-b"),
+            &["sess-1".into()],
+            |_| {
+                probes.set(probes.get() + 1);
+                if probes.get() == 1 {
+                    return false;
+                }
+                assert!(matches!(
+                    session_link::try_lock_file(&lock_path),
+                    Err(session_link::LockError::Busy)
+                ));
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err, SESSION_COPY_APP_RUNNING);
+        assert_eq!(probes.get(), 2);
+        assert!(env.rows_for("uid-b").is_empty());
+        assert_eq!(env.body_files().len(), 1);
     }
 
     // ---------------------------------------------------------------------------
@@ -5749,6 +5744,97 @@ mod tests {
     }
 
     #[test]
+    fn copy_backup_reads_committed_wal_without_copying_sidecars() {
+        let env = ready_env("wal-consistent-backup");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id,user_id,title) VALUES('wal-only','uid-a','WAL fixture')",
+            [],
+        )
+        .unwrap();
+        let wal = PathBuf::from(format!("{}-wal", env.paths.workbuddy_db().display()));
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        let snapshot = backup_workbuddy_db(&env.paths, &env.paths.backup_root()).unwrap();
+        assert!(!snapshot.with_file_name("workbuddy.db-wal").exists());
+        assert!(!snapshot.with_file_name("workbuddy.db-shm").exists());
+        let backup = open_db(&snapshot, true).unwrap();
+        let title: String = backup
+            .query_row(
+                "SELECT title FROM sessions WHERE id='wal-only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "WAL fixture");
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(backup_workbuddy_db(&env.paths, &env.paths.backup_root())
+            .unwrap_err()
+            .contains("未覆盖"));
+    }
+
+    #[test]
+    fn copy_backup_rejects_foreign_key_violation_before_body_writes() {
+        let env = ready_env("foreign-key-backup-rejected");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF; CREATE TABLE child(owner TEXT REFERENCES sessions(id)); INSERT INTO child VALUES('missing');").unwrap();
+        drop(conn);
+        let before = std::fs::read(env.body_path("sess-1")).unwrap();
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert!(report["copied"].as_array().unwrap().is_empty());
+        assert!(report["errors"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("外键"));
+        assert!(env.rows_for("uid-b").is_empty());
+        assert_eq!(std::fs::read(env.body_path("sess-1")).unwrap(), before);
+        assert_eq!(env.body_files().len(), 1);
+    }
+
+    #[test]
+    fn copy_row_transaction_rolls_back_trigger_foreign_key_failure() {
+        let env = ready_env("foreign-key-trigger");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch("CREATE TABLE child(owner TEXT REFERENCES sessions(id)); CREATE TRIGGER bad_child AFTER INSERT ON sessions WHEN NEW.user_id='uid-b' BEGIN INSERT INTO child VALUES('missing'); END;").unwrap();
+        drop(conn);
+        assert!(insert_session_copy(
+            &env.paths,
+            &env.paths,
+            "fiction-copy",
+            "sess-1",
+            "uid-a",
+            "uid-b"
+        )
+        .is_err());
+        assert!(env.rows_for("uid-b").is_empty());
+        let conn = open_db(&env.paths.workbuddy_db(), true).unwrap();
+        session_backup::verify_database_integrity(&conn).unwrap();
+    }
+
+    #[test]
+    fn incompatible_schema_stops_copy_before_target_body_is_created() {
+        let env = ready_env("schema-change-stop");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sessions RENAME COLUMN updated_at TO incompatible_updated_at",
+        )
+        .unwrap();
+        drop(conn);
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert!(report["copied"].as_array().unwrap().is_empty());
+        assert!(report["errors"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("结构不兼容"));
+        assert_eq!(env.body_files().len(), 1);
+        assert!(env.rows_for("uid-b").is_empty());
+    }
+
+    #[test]
     fn session_row_owner_reads_target_uid() {
         let env = ready_env("row-owner");
         assert_eq!(
@@ -5968,10 +6054,9 @@ mod tests {
         )
     }
 
-    /// 跨档门禁只拦「目标账号 = 目标档当前登录账号」：App 运行中
-    /// 目标≠当前登录 → 放行；目标=当前登录 → 拒绝；读不到登录态 → 保守拒绝。
+    /// A running target variant blocks every owner of its shared database.
     #[test]
-    fn cross_copy_gate_only_blocks_current_login_target() {
+    fn cross_copy_gate_blocks_every_target_account_in_running_variant() {
         let env = CrossEnv::new("cross-gate");
         env.create_db(WbVariant::Cn, "");
         env.create_edge_db(WbVariant::Cn);
@@ -5992,11 +6077,10 @@ mod tests {
             )
         };
 
-        // 目标档登录的是别人（uid-x）：运行中放行，副本落库。
+        // A non-current target still shares the database.
         env.set_login(WbVariant::Ai, "uid-x");
-        let report = run("uid-b").expect("目标≠当前登录：运行中必须放行");
-        let new_id = report["copied"][0]["newId"].as_str().unwrap().to_string();
-        assert_eq!(env.rows_for(WbVariant::Ai, "uid-b"), vec![new_id]);
+        assert_eq!(run("uid-b").unwrap_err(), SESSION_COPY_APP_RUNNING);
+        assert!(env.rows_for(WbVariant::Ai, "uid-b").is_empty());
 
         // 目标账号正是目标档当前登录账号：运行中拒绝，且不再写入。
         env.set_login(WbVariant::Ai, "uid-b");
@@ -6004,7 +6088,7 @@ mod tests {
         assert_eq!(err, SESSION_COPY_APP_RUNNING);
         assert_eq!(
             env.rows_for(WbVariant::Ai, "uid-b").len(),
-            1,
+            0,
             "未新增副本行"
         );
 
@@ -6013,8 +6097,7 @@ mod tests {
         let err = run("uid-b").unwrap_err();
         assert_eq!(err, SESSION_COPY_APP_RUNNING);
 
-        // App 未运行：任何目标都放行（登录态缺失也不再拦截）；此时源会话已有
-        // 有效副本，返回 alreadyLinked 而非再次复制。
+        // The fictional closed target is now safe to copy once.
         let report = cross_copy_with_probe(
             &env,
             WbVariant::Cn,
@@ -6025,10 +6108,7 @@ mod tests {
             |_| false,
         )
         .unwrap();
-        assert!(
-            !report["alreadyLinked"].as_array().unwrap().is_empty(),
-            "{report}"
-        );
+        assert!(!report["copied"].as_array().unwrap().is_empty(), "{report}");
         assert!(report.get("errors").is_none(), "{report}");
     }
 
@@ -7372,18 +7452,18 @@ mod tests {
         let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
         let one = [selection(&group_id, &token, SyncMode::FastForward)];
 
-        // 目标账号不是当前登录账号（auth=uid-a）：App 运行中不再拦截，正常同步（S5 实测口径）。
-        let report = sync_sessions_for_switch_at(
+        // All accounts share the same database: a running target variant blocks writes.
+        let err = sync_sessions_for_switch_at(
             &env.paths(),
             WbVariant::Cn,
             &env.target("uid-b"),
             &one,
             |_| true,
         )
-        .unwrap();
-        assert_eq!(report["synced"].as_array().unwrap().len(), 1);
+        .unwrap_err();
+        assert_eq!(err, SESSION_COPY_APP_RUNNING);
         let target_body_after = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
-        assert_ne!(target_body_before, target_body_after, "目标正文已追平");
+        assert_eq!(target_body_before, target_body_after);
 
         // 空选择项 → 什么都不做，也不要求关闭 App。
         let report = sync_sessions_for_switch_at(

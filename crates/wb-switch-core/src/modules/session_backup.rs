@@ -223,6 +223,50 @@ pub fn ensure_full_synchronous(conn: &rusqlite::Connection) -> Result<(), String
     Ok(())
 }
 
+/// Check every integrity result and foreign-key violation, including violations created
+/// by older connections that did not enable enforcement. Do not expose row values.
+pub fn verify_database_integrity(conn: &rusqlite::Connection) -> Result<(), String> {
+    let mut statement = conn
+        .prepare("PRAGMA quick_check")
+        .map_err(|_| "数据库完整性检查失败".to_string())?;
+    let checks = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| "数据库完整性检查失败".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "数据库完整性检查失败".to_string())?;
+    if checks.is_empty() || checks.iter().any(|check| check != "ok") {
+        return Err("数据库完整性检查未通过，已停止写入".into());
+    }
+    let mut statement = conn
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|_| "数据库外键检查失败".to_string())?;
+    let mut rows = statement
+        .query([])
+        .map_err(|_| "数据库外键检查失败".to_string())?;
+    if rows
+        .next()
+        .map_err(|_| "数据库外键检查失败".to_string())?
+        .is_some()
+    {
+        return Err("数据库存在外键约束错误，已停止写入".into());
+    }
+    Ok(())
+}
+
+pub fn prepare_write_connection(conn: &rusqlite::Connection) -> Result<(), String> {
+    ensure_full_synchronous(conn)?;
+    conn.execute_batch("PRAGMA foreign_keys=ON")
+        .map_err(|_| "无法启用数据库外键约束".to_string())?;
+    let enabled: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .map_err(|_| "无法核验数据库外键约束".to_string())?;
+    if enabled != 1 {
+        return Err("数据库外键约束未启用，已停止写入".into());
+    }
+    crate::modules::session_safety::validate_session_schema(conn)?;
+    verify_database_integrity(conn)
+}
+
 // ---------------------------------------------------------------------------
 // 路径（可信根 + 校验后的 UUID 推导）
 // ---------------------------------------------------------------------------

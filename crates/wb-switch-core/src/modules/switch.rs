@@ -161,6 +161,11 @@ pub fn switch_account(
     }
     // 档位以账号自身为准：签名里的参数无法表达「用 A 档位操作 B 档位账号」。
     let variant = account::variant_of(&acc);
+    crate::modules::session_safety::preflight_switch(
+        &SessionPaths::for_variant(variant),
+        variant,
+        !copy_session_ids.is_empty() || !sync_selections.is_empty(),
+    )?;
     let backup = auth_file::backup_auth_file(variant);
 
     let mut copy_report: Option<Value> = None;
