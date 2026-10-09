@@ -12,27 +12,17 @@ mod api;
 use serde_json::json;
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, config, process, rotate, travel, update, variant::WbVariant,
+    account, auth_file, config, process, rotate, travel, update, variant::WbVariant,
 };
 
 fn default_port() -> u16 {
     57890
 }
 
-/// 后台任务：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
-/// 签到时间段时固定 30 分钟）；自动轮换按配置间隔执行；
-/// 限额 hook 信号每秒轮询一次、启动时后台默认接入。
+/// 每日签到由统一服务轮询配置，授权未验证时仅记录后台心跳。
+/// 其他上游后台任务保留原行为，真实运行仍需单独验收。
 fn spawn_background_loops() {
-    tokio::spawn(async move {
-        if let Err(error) = config::compact_checkin_logs() {
-            eprintln!("[签到] 历史日志整理失败: {error}");
-        }
-        let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::StartupVerify).await;
-        loop {
-            tokio::time::sleep(checkin::next_cycle_delay()).await;
-            let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
-        }
-    });
+    tokio::spawn(wb_switch_core::modules::manager_scheduler::background_loop());
 
     tokio::spawn(async move {
         let mut last_cycle_at: i64 = 0;

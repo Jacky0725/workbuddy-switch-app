@@ -5647,8 +5647,10 @@ version = "0.1.58"
 dependencies = [
  "axum",
  "rust-embed",
+ "serde",
  "serde_json",
  "tokio",
+ "tower",
  "wb-switch-core",
 ]
 

@@ -1114,8 +1114,27 @@ pub fn get_auto_checkin_config() -> Value {
 /// POST /api/checkin/config —— 保存自动签到配置。
 #[tauri::command]
 pub fn save_auto_checkin_config(config: Value) -> Result<Value, String> {
-    crate::modules::config::save_checkin_config(&config).map_err(|e| e.to_string())?;
-    Ok(crate::modules::config::load_checkin_config())
+    let _ = config;
+    Err("旧自动签到设置已停用，请使用自动签到页面".into())
+}
+
+#[tauri::command]
+pub fn get_manager_scheduler(
+) -> Result<wb_switch_core::modules::manager_scheduler::SchedulerSnapshot, String> {
+    wb_switch_core::modules::manager_scheduler::snapshot()
+}
+
+#[tauri::command]
+pub fn save_manager_scheduler(
+    request: wb_switch_core::modules::manager_scheduler::SaveSchedulerRequest,
+) -> Result<wb_switch_core::modules::manager_scheduler::SchedulerSnapshot, String> {
+    wb_switch_core::modules::manager_scheduler::save(request)
+}
+
+#[tauri::command]
+pub fn run_manager_checkin(account_id: Option<String>) -> Result<(), String> {
+    let _ = account_id;
+    wb_switch_core::modules::manager_scheduler::run_now()
 }
 
 /// GET /api/checkin/logs —— 签到日志（每行带 `variant`，便于前端按档位过滤）。

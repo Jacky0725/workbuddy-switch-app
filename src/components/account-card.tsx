@@ -267,6 +267,7 @@ interface Props {
   onShowInfo?: (a: AccountMeta) => void;
   onSwitch?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
+  dailyPlan?: { today: string; next: string };
   /** 单账号参与许可，独立于全局开关；undefined 表示配置尚未加载。 */
   autoCheckinAllowed?: boolean;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
@@ -409,7 +410,7 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInfo, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInfo, onSwitch, todayCheckedIn, dailyPlan, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
   /** 支持工具开关：关闭的端整块不渲染（缺省视为开启）。 */
   const toolEnabled = (id: ToolId) => enabledTools?.[id] !== false;
   const [resourcesOpen, setResourcesOpen] = useState(false);
@@ -719,6 +720,10 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
       {/* 下内边距比上内边距大一档（紧凑 16 vs 12、宽松 20 vs 16）：顶部那条是卡内部分隔线，
           底部是卡片外缘 —— 同值留白在边缘处看起来更紧，需要补偿才与顶部视觉一致。 */}
       <section className={cn("flex min-w-0 flex-1 flex-col", compact ? "px-3.5 pb-4 pt-3" : "px-5 pb-5 pt-4")}>
+        {dailyPlan && <div className="mb-3 space-y-1 text-xs text-muted-foreground" aria-label="每日签到计划">
+          <p>{dailyPlan.today}</p><p>{dailyPlan.next}</p>
+        </div>}
+
         {creditLoading ? (
           <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />积分查询中…</div>
         ) : !credit ? (

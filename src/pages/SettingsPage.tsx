@@ -1,8 +1,8 @@
+import { Link } from "react-router-dom";
 import { useEffect, useRef, useState, type ReactElement, type ReactNode } from "react";
 import {
   ArrowUpCircle,
   ChevronDown,
-  CircleCheck,
   ExternalLink,
   Loader2,
   RefreshCw,
@@ -29,19 +29,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { TimePicker } from "@/components/ui/time-picker";
-import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
 import { canPersistErrorLog } from "@/lib/error-report";
 import { setSessionsNavEnabled, useSessionsNavEnabled } from "@/lib/nav-prefs";
 import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
 import { SUPPORTED_TOOLS, setToolEnabled, useSupportedTools, type ToolId } from "@/lib/supported-tools";
 import type {
-  AccountMeta,
   AppNotification,
   AutoRotateConfig,
-  CheckinConfig,
-  CheckinLog,
   GithubConfig,
   RateLimitConfig,
   RateLimitHookStatus,
@@ -54,7 +49,7 @@ import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib
 import { useUpdateState } from "@/lib/use-update-state";
 import { changeCompanionEnabled, reloadCompanionEnabled, useCompanionEnabled } from "@/lib/use-companion-enabled";
 import { cn } from "@/lib/utils";
-import { accountVariant, variantSupportsCheckin, variantSupportsTravel, variantUsesIntlCodebuddyIde } from "@/lib/variant";
+import { variantSupportsTravel, variantUsesIntlCodebuddyIde } from "@/lib/variant";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
 import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, CodeBuddyMark, JetbrainsMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
@@ -265,43 +260,6 @@ function formatTime(ts: number): string {
   }
 }
 
-function logLabel(result: string): { text: string; tone: "success" | "warning" | "error" } {
-  switch (result) {
-    case "success":
-      return { text: "签到成功", tone: "success" };
-    case "already":
-      return { text: "已签到", tone: "warning" };
-    default:
-      return { text: "失败", tone: "error" };
-  }
-}
-
-/** "HH:MM" → 当日分钟数；非法返回 null。 */
-function clockMinutes(value: string): number | null {
-  const match = /^(\d{1,2}):(\d{2})$/.exec(value);
-  if (!match) return null;
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  if (hour > 23 || minute > 59) return null;
-  return hour * 60 + minute;
-}
-
-/**
- * 签到时间段的非法组合说明；返回 null 表示可以落盘（两端都合法或两端都空）。
- *
- * 半填 / 非法组合只改本地显示、不写盘：后端把这种窗口当「不限制」处理，写盘会让下一轮
- * 对全部账号发起窗口外签到，所以文案要说明「未保存」。
- */
-function checkinWindowIssue(start: string, end: string): string | null {
-  if (!start && !end) return null;
-  if (!start || !end) return "开始与结束时间需同时选择，当前选择未保存";
-  const startMinutes = clockMinutes(start);
-  const endMinutes = clockMinutes(end);
-  if (startMinutes === null || endMinutes === null) return "时间格式应为 HH:MM，当前选择未保存";
-  if (startMinutes >= endMinutes) return "结束时间需晚于开始时间（不支持跨午夜），当前选择未保存";
-  return null;
-}
-
 /** 数字参数：展示名 + 收敛边界（与输入框 min/max 同源）。 */
 interface NumberFieldSpec {
   label: string;
@@ -333,14 +291,6 @@ interface SaveCommit<T> {
   success?: { title: string; description?: string };
 }
 
-/** 签到数字参数（后端不做范围校验，前端按这里的边界收敛后提交）。 */
-const CHECKIN_NUMBER_FIELDS = {
-  keepalive_days: { label: "保活阈值", min: 0, max: 90 },
-  lazy_refresh_hours: { label: "惰性刷新", min: 1, max: 72 },
-} as const satisfies Record<string, NumberFieldSpec>;
-
-type CheckinNumberKey = keyof typeof CHECKIN_NUMBER_FIELDS;
-
 /** 轮换数字参数。 */
 const ROTATE_NUMBER_FIELDS = {
   check_interval_minutes: { label: "检查间隔", min: 1, max: 1440 },
@@ -352,458 +302,16 @@ const ROTATE_NUMBER_FIELDS = {
 
 type RotateNumberKey = keyof typeof ROTATE_NUMBER_FIELDS;
 
-/** 自动签到配置 + 一键签到 + 日志（含自动旅行行）。 */
+/** 单一计划入口，旧随机时间段配置不再可编辑。 */
 function AutoCheckinCard() {
-  /** 自动旅行与自动签到同卡，按档位决定是否渲染该行（国际版无成长中心）。 */
   const variant = useAccountsStore((s) => s.variant);
-  const accounts = useAccountsStore((s) => s.accounts);
-  const fetchAll = useAccountsStore((s) => s.fetchAll);
-  const [cfg, setCfg] = useState<CheckinConfig | null>(null);
-  /** 显示草稿的同步镜像：事件回调与异步回读都要读最新值，state 只负责渲染。 */
-  const draftRef = useRef<CheckinConfig | null>(null);
-  /** 最近一次落盘的配置：即时落盘以它为提交基准，未落盘的草稿不写盘。 */
-  const savedRef = useRef<CheckinConfig | null>(null);
-  /** 待提交编辑：同一次交互里的连续触发合并为一份最新快照。 */
-  const pendingRef = useRef<SaveCommit<CheckinConfig> | null>(null);
-  /** 提交链：串行发送，避免先发的那份（不含后一次编辑）后到达覆盖新值。 */
-  const chainRef = useRef<Promise<void>>(Promise.resolve());
-  /** 数字输入框草稿文本：只覆盖正在编辑的字段，失焦提交后清空。 */
-  const [numDraft, setNumDraft] = useState<Partial<Record<CheckinNumberKey, string>>>({});
-  /**
-   * 手风琴展开的面板：参数区 / 逐账号开关 / 签到日志。
-   *
-   * 用 multiple 而非 single：三块内容彼此独立，用户可能同时对照参数与账号名单。
-   */
-  const [openSections, setOpenSections] = useState<string[]>([]);
-  const logsOpen = openSections.includes("logs");
-  const [logs, setLogs] = useState<CheckinLog[] | null>(null);
-  const [logsError, setLogsError] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    void loadConfig();
-  }, []);
-
-  // 账号列表来自全局 store：为空时补拉一次（只取状态与账号，不拉积分）。
-  useEffect(() => {
-    if (accounts.length === 0) void fetchAll();
-  }, [accounts.length, fetchAll]);
-
-  // 日志懒加载：展开时才请求，每次展开重新拉取；收起态无可见列表，不请求。
-  useEffect(() => {
-    if (!logsOpen) return;
-    let cancelled = false;
-    void loadLogs(() => cancelled);
-    return () => {
-      cancelled = true;
-    };
-  }, [logsOpen]);
-
-  async function loadConfig() {
-    try {
-      const loaded = await api.getAutoCheckinConfig();
-      savedRef.current = loaded;
-      adoptSaved(loaded);
-    } catch (e) {
-      toast.error("自动签到配置加载失败", { description: api.asError(e) });
-    }
-  }
-
-  /** 更新显示草稿（state 供渲染，ref 供事件回调与异步回读读最新值）。 */
-  function updateCfg(next: CheckinConfig) {
-    draftRef.current = next;
-    setCfg(next);
-  }
-
-  /** 落盘值回填显示：保留半填 / 非法时间段草稿，那是刻意不落盘的本地状态。 */
-  function adoptSaved(next: CheckinConfig) {
-    const draft = draftRef.current;
-    if (draft && checkinWindowIssue(draft.checkin_start, draft.checkin_end) !== null) {
-      updateCfg({ ...next, checkin_start: draft.checkin_start, checkin_end: draft.checkin_end });
-      return;
-    }
-    updateCfg(next);
-  }
-
-  /**
-   * 即时落盘：编辑先合并成一份最新快照，再串行提交。
-   *
-   * 同一次交互里开关 click 与输入框 blur 会先后触发，各自都带整份配置；并发发送时
-   * 先发的那份（不含后一次编辑）可能后到达，把新值覆盖回去。
-   */
-  function enqueueCheckinSave(
-    edits: Partial<CheckinConfig>,
-    success?: SaveCommit<CheckinConfig>["success"],
-  ) {
-    if (!savedRef.current) return;
-    const pending = pendingRef.current;
-    pendingRef.current = { edits: { ...pending?.edits, ...edits }, success: success ?? pending?.success };
-    setSaving(true);
-    chainRef.current = chainRef.current.then(flushCheckinSave);
-  }
-
-  async function flushCheckinSave() {
-    const commit = pendingRef.current;
-    pendingRef.current = null;
-    const saved = savedRef.current;
-    if (!commit || !saved) return;
-    try {
-      const next = await api.saveAutoCheckinConfig({ ...saved, ...commit.edits });
-      savedRef.current = next;
-      // 回读值只在没有更新编辑排队时才整体覆盖显示，避免顶掉刚做出的改动。
-      if (!pendingRef.current) adoptSaved(next);
-      if (commit.success) {
-        toast.success(commit.success.title, { description: commit.success.description });
-      }
-    } catch (e) {
-      adoptSaved(saved);
-      toast.error("自动签到设置保存失败", { description: api.asError(e) });
-    } finally {
-      if (!pendingRef.current) setSaving(false);
-    }
-  }
-
-  /** 主开关：拨动即落盘，失败回滚到上一份已确认配置。 */
-  function onToggleEnabled(enabled: boolean) {
-    const current = draftRef.current;
-    if (!current) return;
-    updateCfg({ ...current, enabled });
-    enqueueCheckinSave({ enabled }, { title: enabled ? "自动签到已开启" : "自动签到已关闭" });
-  }
-
-  /** 数字参数：失焦 / 回车提交；空值回退原值，越界收敛，与落盘值相同则不发请求。 */
-  function onNumberCommit(key: CheckinNumberKey, raw: string) {
-    const current = draftRef.current;
-    const saved = savedRef.current;
-    if (!current || !saved) return;
-    const field = CHECKIN_NUMBER_FIELDS[key];
-    const value = resolveNumberInput(raw, field);
-    clearNumDraft(key);
-    const next = { ...current };
-    next[key] = value ?? saved[key];
-    updateCfg(next);
-    if (value === null) {
-      toast.error(numberInputHint(field));
-      return;
-    }
-    if (value === saved[key]) return;
-    const edits: Partial<CheckinConfig> = {};
-    edits[key] = value;
-    enqueueCheckinSave(edits, { title: `${field.label}已保存` });
-  }
-
-  /**
-   * 时间段：先只改本地显示；仅「两端都填且 start < end」或「两端都清空」才落盘。
-   * 半填 / 非法组合不写盘（后端把这种窗口当「不限制」，写盘会让下一轮对全部账号发起签到）。
-   */
-  function onWindowChange(key: "checkin_start" | "checkin_end", value: string) {
-    const current = draftRef.current;
-    const saved = savedRef.current;
-    if (!current || !saved) return;
-    const next = { ...current };
-    next[key] = value;
-    updateCfg(next);
-    if (checkinWindowIssue(next.checkin_start, next.checkin_end) !== null) return;
-    if (next.checkin_start === saved.checkin_start && next.checkin_end === saved.checkin_end) return;
-    enqueueCheckinSave(
-      { checkin_start: next.checkin_start, checkin_end: next.checkin_end },
-      next.checkin_start
-        ? { title: "签到时间段已保存", description: `${next.checkin_start} 至 ${next.checkin_end}` }
-        : { title: "已清除签到时间段限制" },
-    );
-  }
-
-  /** 「清除」按钮：两端清空属完整语义，立即落盘。 */
-  function clearWindow() {
-    const current = draftRef.current;
-    const saved = savedRef.current;
-    if (!current || !saved) return;
-    updateCfg({ ...current, checkin_start: "", checkin_end: "" });
-    if (!saved.checkin_start && !saved.checkin_end) return;
-    enqueueCheckinSave(
-      { checkin_start: "", checkin_end: "" },
-      { title: "已清除签到时间段限制" },
-    );
-  }
-
-  async function loadLogs(isCancelled?: () => boolean) {
-    setLogsError("");
-    try {
-      const res = await api.getCheckinLogs();
-      if (!isCancelled?.()) setLogs(res.logs);
-    } catch (e) {
-      if (isCancelled?.()) return;
-      setLogs(null);
-      setLogsError(api.asError(e));
-    }
-  }
-
-  async function checkinAllNow() {
-    if (busy || saving) return;
-    setBusy(true);
-    try {
-      const res = await api.checkinAll();
-      if (res.status === "skipped" && res.reason === "already_running") {
-        toast.error("签到任务正在进行，请稍后再试");
-        return;
-      }
-      const ok = res.accounts.filter((a) => a.result === "success").length;
-      const already = res.accounts.filter((a) => a.result === "already").length;
-      const err = res.accounts.filter((a) => a.result === "error").length;
-      const skipped = res.accounts.filter(
-        (a) => a.result === "skipped" && a.reason === "auto_checkin_disabled",
-      ).length;
-      const detail = res.accounts
-        .filter((a) => a.result === "error")
-        .map((a) => `${a.email}（${a.error}）`)
-        .join("；");
-      const text = `签到完成：成功 ${ok}，已签 ${already}，失败 ${err}，已忽略 ${skipped} 个关闭自动签到的账号${detail ? `。${detail}` : ""}`;
-      const allFailed = res.accounts.length > 0 && err === res.accounts.length;
-      const allSkippedOrUnavailable =
-        res.accounts.length === 0 || (ok === 0 && already === 0 && err === 0);
-      if (allFailed) toast.error(text);
-      else if (allSkippedOrUnavailable) toast.info(text);
-      else toast.success(text);
-      void loadConfig();
-      if (logsOpen) void loadLogs();
-    } catch (e) {
-      toast.error("签到失败", { description: api.asError(e) });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  /**
-   * 逐账号开关：切换即落盘，提交最新一份名单。
-   *
-   * 与参数编辑共用同一条提交链，名单从当前显示草稿派生（连续切换不会互相覆盖），
-   * 失败由提交链统一回滚并提示。
-   */
-  function onAutoCheckinChange(account: AccountMeta, allowed: boolean) {
-    const current = draftRef.current;
-    if (!current) return;
-    const excluded = new Set(current.excluded_account_ids ?? []);
-    if (allowed) excluded.delete(account.id);
-    else excluded.add(account.id);
-    const next = [...excluded];
-    updateCfg({ ...current, excluded_account_ids: next });
-    enqueueCheckinSave({ excluded_account_ids: next });
-  }
-
-  /** 数字输入框：输入期间只改本地草稿文本，失焦 / 回车才提交。 */
-  function onNumberChange(key: CheckinNumberKey, text: string) {
-    setNumDraft((prev) => ({ ...prev, [key]: text }));
-  }
-
-  function clearNumDraft(key: CheckinNumberKey) {
-    setNumDraft((prev) => {
-      const next = { ...prev };
-      delete next[key];
-      return next;
-    });
-  }
-
-  /** 逐账号开关只列出支持签到的档位（国际版签到接口未开放）。 */
-  const checkinAccounts = accounts.filter((account) => variantSupportsCheckin(accountVariant(account)));
-  const excludedIds = new Set(cfg?.excluded_account_ids ?? []);
-  const windowIssue = cfg ? checkinWindowIssue(cfg.checkin_start, cfg.checkin_end) : null;
-
-  return (
-    <SettingsGroup
-      id="settings-auto-checkin"
-      title="自动签到"
-    >
-      <CardContent className="space-y-0 p-0">
-        <Accordion type="multiple" value={openSections} onValueChange={setOpenSections}>
-          {cfg ? (
-            <>
-              <AccordionSettingsRow
-                value="params"
-                label="启用自动签到"
-                description="为允许自动签到的账号核验状态并补签；可在下方按账号关闭"
-                actions={
-                  <>
-                    <DemoAction>
-                      <Switch
-                        aria-label="启用自动签到"
-                        checked={cfg.enabled}
-                        onCheckedChange={onToggleEnabled}
-                      />
-                    </DemoAction>
-                    <DemoAction>
-                      <Button size="sm" variant="outline" onClick={checkinAllNow} disabled={busy || saving}>
-                        {busy ? <Loader2 className="animate-spin" /> : <CircleCheck />}全部立即签到
-                      </Button>
-                    </DemoAction>
-                  </>
-                }
-              >
-                <div className={INSET_PANEL}>
-                  <SettingsFieldRow
-                    className={PANEL_ROW}
-                    label="签到时间段"
-                    description={
-                      <>
-                        留空为不限制。设置后每天在窗口内随机时刻自动签到。
-                        <span className="mt-0.5 block">需 App 在窗口附近运行才能按时执行。</span>
-                      </>
-                    }
-                  >
-                    <div className="flex min-w-0 w-full flex-col items-end gap-1 sm:w-auto">
-                      <div className="flex min-w-0 w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
-                        <DemoAction className="min-w-0 flex-1 sm:flex-none">
-                          <TimePicker
-                            className="min-w-0 flex-1 sm:flex-none"
-                            value={cfg.checkin_start}
-                            hourLabel="签到开始时间（小时）"
-                            minuteLabel="签到开始时间（分钟）"
-                            onChange={(v) => onWindowChange("checkin_start", v)}
-                          />
-                        </DemoAction>
-                        <span className="shrink-0 text-xs text-muted-foreground">至</span>
-                        <DemoAction className="min-w-0 flex-1 sm:flex-none">
-                          <TimePicker
-                            className="min-w-0 flex-1 sm:flex-none"
-                            value={cfg.checkin_end}
-                            hourLabel="签到结束时间（小时）"
-                            minuteLabel="签到结束时间（分钟）"
-                            onChange={(v) => onWindowChange("checkin_end", v)}
-                          />
-                        </DemoAction>
-                        {(cfg.checkin_start || cfg.checkin_end) && (
-                          <DemoAction>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="shrink-0"
-                              onClick={clearWindow}
-                            >
-                              清除
-                            </Button>
-                          </DemoAction>
-                        )}
-                      </div>
-                      {windowIssue && (
-                        <p className="text-xs leading-4 text-amber-600">{windowIssue}</p>
-                      )}
-                    </div>
-                  </SettingsFieldRow>
-
-                  <NumberSettingRow
-                    className={PANEL_ROW}
-                    id="ac-keep"
-                    spec={CHECKIN_NUMBER_FIELDS.keepalive_days}
-                    description="天；0 表示每天无条件刷新"
-                    value={numDraft.keepalive_days ?? String(cfg.keepalive_days)}
-                    onChange={(text) => onNumberChange("keepalive_days", text)}
-                    onCommit={(raw) => onNumberCommit("keepalive_days", raw)}
-                  />
-                  <NumberSettingRow
-                    className={cn(PANEL_ROW, "border-b-0")}
-                    id="ac-lazy"
-                    spec={CHECKIN_NUMBER_FIELDS.lazy_refresh_hours}
-                    description="小时"
-                    value={numDraft.lazy_refresh_hours ?? String(cfg.lazy_refresh_hours)}
-                    onChange={(text) => onNumberChange("lazy_refresh_hours", text)}
-                    onCommit={(raw) => onNumberCommit("lazy_refresh_hours", raw)}
-                  />
-                </div>
-              </AccordionSettingsRow>
-
-              {/* 逐账号开关：切换即落盘，与参数编辑共用同一条提交链。 */}
-              <AccordionSettingsRow
-                value="excluded"
-                label="不参与自动签到的账号"
-                description="关闭后，后台轮次、刷新积分与全部立即签到都会跳过该账号；仍可在账号卡片进行单账号手动签到。"
-              >
-                <div className={INSET_PANEL}>
-                  {checkinAccounts.length === 0 ? (
-                    <p className="py-2 text-xs text-muted-foreground">暂无可签到的账号</p>
-                  ) : (
-                    checkinAccounts.map((account) => {
-                      const name = displayName(account);
-                      return (
-                        <div
-                          key={account.id}
-                          className="flex min-w-0 items-center justify-between gap-3 border-b border-border/50 py-2.5 last:border-b-0"
-                        >
-                          <span className="min-w-0 flex-1 truncate text-xs leading-4" title={name}>
-                            {name}
-                          </span>
-                          <DemoAction>
-                            <Switch
-                              checked={!excludedIds.has(account.id)}
-                              onCheckedChange={(allowed) => onAutoCheckinChange(account, allowed)}
-                              aria-label={`${name}参与自动签到`}
-                            />
-                          </DemoAction>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </AccordionSettingsRow>
-            </>
-          ) : (
-            <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">加载配置中…</p>
-          )}
-
-          {/* 成长中心（派猫猫旅行）仅国内版开放：国际版不渲染该行，也不请求其配置。
-              行本身独立于签到配置的加载状态，签到配置读取失败也不影响开关。 */}
-          {variantSupportsTravel(variant) ? <AutoTravelRow /> : null}
-
-          <AccordionSettingsRow
-            value="logs"
-            label="签到日志"
-            description="保留最近 30 天；本机明文保存，可能含账号昵称。"
-            divider={false}
-          >
-            <div className={INSET_PANEL}>
-              {logsError ? (
-                <p className="py-2 text-xs text-destructive">{logsError}</p>
-              ) : !logs ? (
-                <p className="py-2 text-xs text-muted-foreground">正在读取…</p>
-              ) : logs.length === 0 ? (
-                <p className="py-2 text-xs text-muted-foreground">暂无签到记录</p>
-              ) : (
-                <div className="max-h-64 overflow-y-auto pr-1">
-                  {[...logs].reverse().map((l, i) => {
-                    const tone = logLabel(l.result);
-                    return (
-                      <div
-                        key={i}
-                        className="flex items-center justify-between border-b border-border/50 py-2 text-xs last:border-b-0"
-                      >
-                        <div className="min-w-0 flex-1 truncate">
-                          <span className="font-medium">{l.email}</span>
-                          {l.error && <span className="text-destructive">（{l.error}）</span>}
-                        </div>
-                        <div className="ml-2 flex shrink-0 items-center gap-2">
-                          <span
-                            className={
-                              tone.tone === "error"
-                                ? "text-destructive"
-                                : tone.tone === "warning"
-                                  ? "text-amber-600"
-                                  : "text-emerald-600"
-                            }
-                          >
-                            {tone.text}
-                          </span>
-                          <span className="text-muted-foreground">{formatTime(l.ts)}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </AccordionSettingsRow>
-        </Accordion>
-      </CardContent>
-    </SettingsGroup>
-  );
+  return <SettingsGroup id="settings-auto-checkin" title="自动签到">
+    <CardContent className="space-y-4">
+      <p className="text-sm text-muted-foreground">时间、补执行策略、逐账号开关与执行记录已移至自动签到页面。</p>
+      <Button asChild variant="outline"><Link to="/auto-checkin">管理每日签到计划</Link></Button>
+      {variantSupportsTravel(variant) ? <AutoTravelRow /> : null}
+    </CardContent>
+  </SettingsGroup>;
 }
 
 /**
@@ -2092,7 +1600,7 @@ function RateLimitCard() {
   );
 }
 
-/** 设置页：演示模式不渲染自动签到；Agent Companion 只在桌面正式版显示。 */
+/** 设置页：签到入口指向统一计划页；Agent Companion 只在桌面正式版显示。 */
 export default function SettingsPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
@@ -2107,7 +1615,7 @@ export default function SettingsPage() {
         <AppearanceCard />
         <SupportedToolsCard />
         <PermissionCheckCard />
-        {api.isDemoMode() ? null : <AutoCheckinCard />}
+        <AutoCheckinCard />
         <AutoRotateCard />
         <RateLimitCard />
         {api.isDesktop() && !api.isDemoMode() ? <CompanionCard /> : null}

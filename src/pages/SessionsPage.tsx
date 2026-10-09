@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { DialogAutoHeight } from "@/components/ui/dialog-auto-height";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -531,6 +532,10 @@ export default function SessionsPage() {
             </TabsList>
           </Tabs>
         </header>
+        {client === "workbuddy" && !api.isDemoMode() && <Alert className="mb-5">
+          <AlertTitle>会话写入等待兼容性验证</AlertTitle>
+          <AlertDescription>当前客户端版本与数据库结构尚未验证，复制和同步已暂停。通过验证后才能写入会话。</AlertDescription>
+        </Alert>}
         <section aria-labelledby="session-groups-title" className="min-w-0">
           <div className="mb-4 flex flex-wrap items-center gap-2">
             <h2 id="session-groups-title" className="text-base font-semibold tracking-tight">{CLIENTS.find((item) => item.id === client)?.title} 会话</h2>

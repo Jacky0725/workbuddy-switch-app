@@ -13,6 +13,8 @@ import {
   Terminal,
 } from "lucide-react";
 
+import { accountPlanLabel, currentTask, taskLabel } from "@/lib/manager-scheduler";
+import type { ManagerSchedulerSnapshot } from "@/lib/types";
 import { AccountCard } from "@/components/account-card";
 import { AccountInfoDialog } from "@/components/account-info-dialog";
 import { JetbrainsSwitchDialog } from "@/components/jetbrains-switch-dialog";
@@ -193,6 +195,18 @@ export default function AccountsPage() {
    * 以及状态查询、刷新时跳过哪些账号。控制入口在设置页。
    */
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
+  const [managerSchedule, setManagerSchedule] = useState<ManagerSchedulerSnapshot | null>(null);
+  useEffect(() => {
+    let live = true;
+    const reload = async () => {
+      try { const value = await api.getManagerScheduler(); if (live) setManagerSchedule(value); }
+      catch { if (live) setManagerSchedule(null); }
+    };
+    void reload();
+    const interval = window.setInterval(() => void reload(), 30_000);
+    return () => { live = false; window.clearInterval(interval); };
+  }, []);
+
   /** 配置是否已读取完毕（成功或失败）：区分「尚未读到」与「读取失败」。 */
   const [autoCheckinSettled, setAutoCheckinSettled] = useState(false);
   /** 账号 id -> 今日是否已签到（undefined=查询中/未知） */
@@ -240,7 +254,7 @@ export default function AccountsPage() {
   );
   const appName = variantAppName(variant);
   const travelAvailable = variantSupportsTravel(variant);
-  const checkinAvailable = variantSupportsCheckin(variant);
+  const checkinAvailable = variantSupportsCheckin(variant) && (api.isDemoMode() || managerSchedule?.production_enabled === true);
   /** 旅行 chip 与旅行状态轮询只在自动旅行开启后生效（配置未读到 = 未开启）。 */
   const autoTravelEnabled = travelAvailable && autoTravelConfig?.enabled === true;
   /** 刷新按钮文案：国际版没有签到接口，只刷新积分。 */
@@ -1098,7 +1112,8 @@ export default function AccountsPage() {
                 onShowInfo={setInfoTarget}
                 onCheckin={checkinAvailable ? onCheckin : undefined}
                 onRefresh={onRefresh}
-                todayCheckedIn={checkinMap[a.id]}
+                todayCheckedIn={!managerSchedule && checkinAvailable ? checkinMap[a.id] : undefined}
+                dailyPlan={managerSchedule ? { today: taskLabel(currentTask(managerSchedule, a)), next: accountPlanLabel(managerSchedule, a) } : { today: "签到状态未确认", next: "计划尚未读取" }}
                 autoCheckinAllowed={checkinAvailable && autoCheckinSettled ? !excludedCheckinIds.has(a.id) : undefined}
                 travelStatus={autoTravelEnabled ? travelMap[a.id] : undefined}
                 rateLimits={rateLimitEnabled ? rateLimitMap[a.id] : undefined}

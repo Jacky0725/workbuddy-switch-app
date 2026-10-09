@@ -19,6 +19,7 @@ pub mod jetbrains;
 pub mod limits;
 #[cfg(target_os = "linux")]
 pub mod linux_keyring;
+pub mod manager_scheduler;
 pub mod notifications;
 pub mod oauth;
 pub mod official_usage;

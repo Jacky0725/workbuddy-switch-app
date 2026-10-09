@@ -8,6 +8,7 @@ import type {
 import { demoModeEnabled } from "./demo-mode";
 import { accountVariant, normalizeVariant, variantSupportsCheckin } from "./variant";
 
+import { managerDemoSnapshot } from "./manager-scheduler-demo";
 export const screenshotDemoEnabled = demoModeEnabled;
 
 const MODEL_NAMES = ["deepseek-v4-flash", "kimi-k3-1", "deepseek-v4-pro", "glm-5.2", "hy3"] as const;
@@ -922,6 +923,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));
     case "get_credit_statistics": return buildStatistics();
     case "get_token_statistics": return demoTokenStatistics(typeof args?.days === "number" ? args.days : undefined);
+    case "get_manager_scheduler": return managerDemoSnapshot(demoAccounts);
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));

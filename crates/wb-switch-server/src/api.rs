@@ -59,6 +59,9 @@ static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
 
 pub fn router() -> Router {
     Router::new()
+        .merge(manager_scheduler_routes(
+            wb_switch_core::modules::config::store_dir(),
+        ))
         .route("/api/status", get(api_status))
         .route("/api/accounts", get(api_accounts))
         .route("/api/codebuddy-cli/status", get(api_codebuddy_cli_status))
@@ -1511,11 +1514,66 @@ async fn api_checkin_config() -> Response {
 }
 
 async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
-    let submitted = body.get("config").unwrap_or(&body);
-    match config::save_checkin_config(submitted) {
-        Ok(()) => json_ok(config::load_checkin_config()),
-        Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
+    let _ = body;
+    json_err(
+        "旧自动签到设置已停用，请使用自动签到页面".into(),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+fn manager_scheduler_routes(root: std::path::PathBuf) -> Router {
+    use axum::{
+        extract::State,
+        http::Request,
+        middleware::{self, Next},
+    };
+    use wb_switch_core::modules::manager_scheduler as manager;
+    async fn local_origin(request: Request<Body>, next: Next) -> Response {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let local = host
+            .strip_prefix("127.0.0.1:")
+            .or_else(|| host.strip_prefix("localhost:"))
+            .or_else(|| host.strip_prefix("[::1]:"))
+            .is_some_and(|port| port.parse::<u16>().is_ok());
+        let origin_ok = request.headers().get(header::ORIGIN).is_none_or(|origin| {
+            origin
+                .to_str()
+                .is_ok_and(|value| value == format!("http://{host}"))
+        });
+        if !local || !origin_ok {
+            return json_err("请求来源不受信任".into(), StatusCode::FORBIDDEN);
+        }
+        next.run(request).await
     }
+    async fn read(State(root): State<std::path::PathBuf>) -> Response {
+        match manager::snapshot_at(&root, config::now_ms()) {
+            Ok(snapshot) => Json(snapshot).into_response(),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        }
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SaveBody {
+        request: manager::SaveSchedulerRequest,
+    }
+    async fn save(State(root): State<std::path::PathBuf>, Json(body): Json<SaveBody>) -> Response {
+        match manager::save_at(&root, body.request, config::now_ms()) {
+            Ok(snapshot) => Json(snapshot).into_response(),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        }
+    }
+    async fn run() -> Response {
+        json_err(manager::run_now().unwrap_err(), StatusCode::FORBIDDEN)
+    }
+    Router::new()
+        .route("/api/manager/scheduler", get(read).post(save))
+        .route("/api/manager/checkin", post(run))
+        .route_layer(middleware::from_fn(local_origin))
+        .with_state(root)
 }
 
 /// GET /api/checkin/logs —— 签到日志（每行带 `variant`，便于前端按档位过滤）。
@@ -1702,6 +1760,198 @@ mod tests {
     use axum::http::{header, StatusCode, Uri};
     use serde_json::json;
     use wb_switch_core::modules::variant::WbVariant;
+
+    struct ManagerFixture(std::path::PathBuf);
+    impl ManagerFixture {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(
+                std::env::temp_dir()
+                    .join(format!("wbm-http-manager-{}-{unique}", std::process::id())),
+            )
+        }
+    }
+    impl Drop for ManagerFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    async fn manager_request(
+        root: &std::path::Path,
+        method: &str,
+        path: &str,
+        host: &str,
+        origin: Option<&str>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, host)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(value) = origin {
+            request = request.header(header::ORIGIN, value);
+        }
+        let response = super::manager_scheduler_routes(root.to_path_buf())
+            .oneshot(
+                request
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn manager_read_is_readonly_and_does_not_claim_execution() {
+        let fixture = ManagerFixture::new();
+        let (status, value) = manager_request(
+            &fixture.0,
+            "GET",
+            "/api/manager/scheduler",
+            "127.0.0.1:57890",
+            None,
+            json!(null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["production_enabled"], false);
+        assert_eq!(value["config"]["enabled"], false);
+        assert_eq!(value["tasks"], json!([]));
+        assert!(!fixture.0.exists());
+    }
+
+    #[tokio::test]
+    async fn manager_save_roundtrip_rejects_stale_revision_and_invalid_schema() {
+        let fixture = ManagerFixture::new();
+        let (_, value) = manager_request(
+            &fixture.0,
+            "GET",
+            "/api/manager/scheduler",
+            "127.0.0.1:57890",
+            None,
+            json!(null),
+        )
+        .await;
+        let mut config = value["config"].clone();
+        config["daily_time"] = json!("10:30");
+        let body = json!({"request": {"config": config, "expected_revision": value["revision"]}});
+        let (status, saved) = manager_request(
+            &fixture.0,
+            "POST",
+            "/api/manager/scheduler",
+            "127.0.0.1:57890",
+            Some("http://127.0.0.1:57890"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["config"]["daily_time"], "10:30");
+        assert_eq!(saved["production_enabled"], false);
+        let bytes = std::fs::read(fixture.0.join("daily_scheduler_config.json")).unwrap();
+        let (status, _) = manager_request(
+            &fixture.0,
+            "POST",
+            "/api/manager/scheduler",
+            "127.0.0.1:57890",
+            None,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut invalid = body.clone();
+        invalid["request"]["config"]["daily_time"] = json!("24:00");
+        assert_eq!(
+            manager_request(
+                &fixture.0,
+                "POST",
+                "/api/manager/scheduler",
+                "127.0.0.1:57890",
+                None,
+                invalid
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let mut unexpected = body;
+        unexpected["request"]["config"]["token"] = json!("fiction");
+        assert_eq!(
+            manager_request(
+                &fixture.0,
+                "POST",
+                "/api/manager/scheduler",
+                "127.0.0.1:57890",
+                None,
+                unexpected
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            std::fs::read(fixture.0.join("daily_scheduler_config.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_foreign_origin_and_dns_rebinding() {
+        let fixture = ManagerFixture::new();
+        for (host, origin) in [
+            ("127.0.0.1:57890", Some("https://foreign.invalid")),
+            ("foreign.invalid:57890", None),
+            ("localhost:57890", Some("null")),
+        ] {
+            assert_eq!(
+                manager_request(
+                    &fixture.0,
+                    "POST",
+                    "/api/manager/scheduler",
+                    host,
+                    origin,
+                    json!({})
+                )
+                .await
+                .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(!fixture.0.exists());
+    }
+
+    #[tokio::test]
+    async fn manager_manual_and_legacy_save_are_blocked_before_any_store_access() {
+        let fixture = ManagerFixture::new();
+        assert_eq!(
+            manager_request(
+                &fixture.0,
+                "POST",
+                "/api/manager/checkin",
+                "127.0.0.1:57890",
+                None,
+                json!({"accountId":"fiction"})
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(!fixture.0.exists());
+        let response = super::api_save_checkin_config(axum::Json(json!({"enabled":true}))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     /// SPA 回退必须按**命中的文件**给 Content-Type：`/sessions` 这类前端路由曾按请求路径
     /// 被标成 application/octet-stream，浏览器直接当文件下载、页面打不开（真机验收发现）。

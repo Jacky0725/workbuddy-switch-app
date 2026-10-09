@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountMeta,
+  ManagerSchedulerConfig,
+  ManagerSchedulerSnapshot,
   AccountRecord,
   AppNotification,
   AppStatus,
@@ -63,6 +65,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 const API_BASE = "http://127.0.0.1:57890";
 
 const DEMO_READ_COMMANDS = new Set([
+  "get_manager_scheduler",
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "get_jetbrains_status", "list_vscode_sessions", "list_codebuddy_ide_sessions", "list_codebuddy_intl_ide_sessions", "vscode_session_links_preview", "codebuddy_ide_session_links_preview", "codebuddy_intl_ide_session_links_preview", "list_account_sessions", "session_links_preview_cross", "list_session_groups", "get_session_group", "preview_session_group_pair", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
@@ -105,6 +108,9 @@ type Route = { method: "GET" | "POST"; path: string };
 
 /** Tauri command → HTTP 路由映射（webui 模式）。 */
 const ROUTES: Record<string, Route> = {
+  get_manager_scheduler: { method: "GET", path: "/api/manager/scheduler" },
+  save_manager_scheduler: { method: "POST", path: "/api/manager/scheduler" },
+  run_manager_checkin: { method: "POST", path: "/api/manager/checkin" },
   get_status: { method: "GET", path: "/api/status" },
   get_accounts: { method: "GET", path: "/api/accounts" },
   get_codebuddy_cli_status: { method: "GET", path: "/api/codebuddy-cli/status" },
@@ -263,6 +269,12 @@ export function getStatus(variant?: WbVariant): Promise<AppStatus> {
 export function getAccounts(): Promise<{ accounts: AccountMeta[] }> {
   return call("get_accounts");
 }
+
+export function getManagerScheduler(): Promise<ManagerSchedulerSnapshot> { return call("get_manager_scheduler"); }
+export function saveManagerScheduler(config: ManagerSchedulerConfig, expectedRevision: string): Promise<ManagerSchedulerSnapshot> {
+  return call("save_manager_scheduler", { request: { config, expected_revision: expectedRevision } });
+}
+export function runManagerCheckin(accountId?: string): Promise<void> { return call("run_manager_checkin", { accountId }); }
 
 export function getCodebuddyCliStatus(): Promise<CodeBuddyCliStatus> {
   return call("get_codebuddy_cli_status");

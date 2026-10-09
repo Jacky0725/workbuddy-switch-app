@@ -53,26 +53,11 @@ pub(crate) fn notify_codebuddy_cli_updated(app: &tauri::AppHandle) {
     }
 }
 
-/// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
-/// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
-/// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
+/// 每日签到由统一服务轮询配置，授权未验证时仅记录后台心跳。
+/// 其他上游后台任务保留原行为，真实运行仍需单独验收。
 fn spawn_background_loops(app: tauri::AppHandle) {
     let rotate_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = modules::config::compact_checkin_logs() {
-            eprintln!("[签到] 历史日志整理失败: {error}");
-        }
-        let _ =
-            modules::checkin::run_checkin_cycle(modules::checkin::CheckinCycleMode::StartupVerify)
-                .await;
-        loop {
-            tokio::time::sleep(modules::checkin::next_cycle_delay()).await;
-            let _ = modules::checkin::run_checkin_cycle(
-                modules::checkin::CheckinCycleMode::PeriodicRecovery,
-            )
-            .await;
-        }
-    });
+    tauri::async_runtime::spawn(modules::manager_scheduler::background_loop());
 
     // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
     // 档位过滤在 core（`travel_capable_accounts`）：不支持成长中心的档位不会发请求。
@@ -275,6 +260,9 @@ pub fn run() {
             commands::checkin,
             commands::checkin_all,
             commands::get_auto_checkin_config,
+            commands::get_manager_scheduler,
+            commands::save_manager_scheduler,
+            commands::run_manager_checkin,
             commands::save_auto_checkin_config,
             commands::get_checkin_logs,
             commands::get_travel_status,

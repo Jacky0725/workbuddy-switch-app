@@ -417,6 +417,25 @@ export interface SwitchResult {
   sessionRecovery?: SessionRecoveryReport;
 }
 
+export interface ManagerSchedulerConfig {
+  version: number; enabled: boolean; timezone: "Asia/Shanghai"; daily_time: string;
+  catch_up: boolean; max_daily_attempts: number; retry_delay_seconds: number;
+  account_enabled: Record<string, boolean>;
+}
+export type ManagerTaskStatus = "Success" | "AlreadyCompleted" | "AuthExpired" | "RequiresUserAction" | "RateLimited" | "NetworkError" | "ServerError" | "Unsupported" | "Unknown" | "Cancelled" | "InProgress";
+export interface ManagerDailyTask {
+  account_id: string; provider: string; region: WbVariant; business_date: string; scheduled_at_ms: number;
+  state: "Pending" | "Missed" | { Finished: ManagerTaskStatus };
+  attempts: number; verification_attempts: number; last_started_at_ms: number | null; uncertain: boolean;
+  events: { started_at_ms: number; finished_at_ms: number; status: ManagerTaskStatus; may_have_completed: boolean; verification_only: boolean }[];
+}
+export interface ManagerSchedulerSnapshot {
+  config: ManagerSchedulerConfig; revision: string; business_date: string; observed_at_ms: number;
+  planned_at_ms: number; next_planned_at_ms: number | null; production_enabled: boolean;
+  blocked_reason: string; background_active: boolean; last_heartbeat_ms: number | null;
+  tasks: ManagerDailyTask[]; history_limit: number;
+}
+
 export interface CheckinConfig {
   enabled: boolean;
   /** 关闭自动签到的账号 id；状态展示和刷新附带签到也跳过，主动手动签到不受影响。 */
