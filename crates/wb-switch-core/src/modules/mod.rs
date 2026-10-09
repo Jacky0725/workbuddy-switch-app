@@ -2,6 +2,7 @@ pub mod account;
 pub mod account_repository;
 pub mod auth_file;
 pub mod checkin;
+pub mod checkin_service;
 pub mod codebuddy_cli;
 pub mod codebuddy_cn_ide;
 pub mod codebuddy_ide;
