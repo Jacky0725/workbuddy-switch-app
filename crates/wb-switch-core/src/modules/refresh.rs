@@ -132,7 +132,22 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let map = account.as_object_mut().unwrap();
     map.remove("needs_relogin");
     map.remove("needs_relogin_reason");
-    let _ = upsert_account(&account);
+    if let Err(error) = upsert_account(&account) {
+        // Never propagate an uncommitted refresh to another client's auth file.
+        // A stale async result must not clobber a newer login's credentials.
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            if let Some(current) = account
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(crate::modules::account::find_account)
+            {
+                return current;
+            }
+        }
+        account["needs_relogin"] = json!(true);
+        account["needs_relogin_reason"] = json!("刷新凭证未能安全保存，请重新授权");
+        return account;
+    }
     // Windows 不执行 apiKeyHelper；当前 CLI 账号刷新后同步 settings env。
     // 同步失败不阻断 WorkBuddy 保活；状态接口会根据 settings 与账号库是否
     // 一致显示“待同步”，避免把认证配置错误混入账号数据。

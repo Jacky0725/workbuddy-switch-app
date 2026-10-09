@@ -773,6 +773,11 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
         });
     }
 
+    if let Some(error) = crate::modules::account_repository::api_capability_error(
+        crate::modules::credential_store::CapabilityType::PointsRead,
+    ) {
+        return json!({"ok": false, "error": error, "reason": "authorization_unverified"});
+    }
     let now = now_ms();
 
     if !uses_three_endpoint_query(variant_of(account)) {

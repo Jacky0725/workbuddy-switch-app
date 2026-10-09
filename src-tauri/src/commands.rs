@@ -67,12 +67,13 @@ fn build_app_status(variant: WbVariant) -> AppStatus {
 ///
 /// 返回全部档位的账号；每行 meta 自带 `variant`，由前端按当前档位过滤。
 #[tauri::command]
-pub fn get_accounts() -> Value {
-    let metas: Vec<Value> = account::load_accounts()
+pub fn get_accounts() -> Result<Value, String> {
+    let metas: Vec<Value> = account::try_load_accounts()
+        .map_err(|e| e.to_string())?
         .iter()
         .map(account::account_meta)
         .collect();
-    json!({ "accounts": metas })
+    Ok(json!({ "accounts": metas }))
 }
 
 /// GET /api/codebuddy-cli/status —— CodeBuddy CLI helper 轮换状态（不含 token）。
@@ -439,13 +440,7 @@ pub async fn detect_codebuddy_ide_account() -> Result<Value, String> {
 /// DELETE /api/delete —— 删除账号。
 #[tauri::command]
 pub fn delete_account(account_id: String) -> Result<Value, String> {
-    let mut accounts = account::load_accounts();
-    let before = accounts.len();
-    accounts.retain(|a| a.get("id").and_then(|v| v.as_str()) != Some(account_id.as_str()));
-    if accounts.len() == before {
-        return Err("账号不存在".to_string());
-    }
-    account::save_accounts(&accounts).map_err(|e| e.to_string())?;
+    account::delete_account(&account_id)?;
     Ok(json!({ "ok": true }))
 }
 
@@ -478,14 +473,14 @@ pub fn import_local(variant: Option<String>) -> Result<Value, String> {
 // 导出 / 导入账号
 // ---------------------------------------------------------------------------
 
-/// POST /api/export-accounts —— 按账号 id 列表导出完整记录（含 token）。
+/// POST /api/export-accounts —— 按账号 id 列表导出公开元数据。
 #[tauri::command]
 pub fn export_accounts(account_ids: Vec<String>) -> Result<Value, String> {
     export_import::export_accounts(&account_ids)
         .map(|records| json!({ "ok": true, "accounts": records }))
 }
 
-/// POST /api/export-accounts-to-path —— 把勾选账号的完整记录写入用户选择的路径（保存对话框产物）。
+/// POST /api/export-accounts-to-path —— 把公开元数据写入用户选择的路径。
 #[tauri::command]
 pub fn export_accounts_to_path(account_ids: Vec<String>, path: String) -> Result<Value, String> {
     export_import::export_accounts_to_path(&account_ids, &path)

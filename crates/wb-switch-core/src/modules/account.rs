@@ -1,4 +1,4 @@
-//! 账号存储：读取/写入 `~/.wb-switch/accounts.json`，与 Python 版共享数据目录。
+//! 账号服务：公开索引与 DPAPI 凭证分离；后台调用保留原来的账号对象接口。
 //!
 //! 对照 server.py `load_accounts` / `save_accounts` / `find_account` /
 //! `account_display_name` / `account_meta`。
@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::modules::config::{accounts_file, atomic_write, now_ms};
+use crate::modules::account_repository::{self, AccountRepository};
+use crate::modules::config::{accounts_file, now_ms};
 use crate::modules::variant::WbVariant;
 
 /// 判断字段是否为 WorkBuddy 5.6 加密信封对象（`{$wbEncrypted, envelope}`）。
@@ -33,45 +34,45 @@ fn has_unexpired_plain_token(acc: &Value) -> bool {
 }
 
 fn load_accounts_from_path(path: &Path) -> Vec<Value> {
-    if let Ok(text) = std::fs::read_to_string(path) {
-        if let Ok(Value::Array(accounts)) = serde_json::from_str::<Value>(&text) {
-            return accounts;
-        }
-    }
-    vec![]
+    AccountRepository::new(path).load().unwrap_or_default()
 }
 
 fn save_accounts_to_path(path: &Path, accounts: &[Value]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(accounts).unwrap_or_default();
-    atomic_write(path, &content)
+    AccountRepository::new(path).save(accounts)
 }
 
 fn find_account_in(accounts: &[Value], account_id: &str) -> Option<Value> {
     accounts
         .iter()
-        .find(|account| {
-            account.get("id").and_then(Value::as_str) == Some(account_id)
-                || account.get("uid").and_then(Value::as_str) == Some(account_id)
-        })
+        .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
         .cloned()
 }
 
 fn delete_account_from_path(path: &Path, account_id: &str) -> Result<(), String> {
-    let mut accounts = load_accounts_from_path(path);
-    let before = accounts.len();
-    accounts.retain(|account| account.get("id").and_then(Value::as_str) != Some(account_id));
-    if accounts.len() == before {
-        return Err("账号不存在".to_string());
-    }
-    save_accounts_to_path(path, &accounts).map_err(|error| error.to_string())
+    AccountRepository::new(path)
+        .update(|accounts| {
+            let before = accounts.len();
+            accounts
+                .retain(|account| account.get("id").and_then(Value::as_str) != Some(account_id));
+            if accounts.len() == before {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "账号不存在",
+                ));
+            }
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
 }
 
 /// 读取账号库；文件缺失或损坏返回空列表。
 pub fn load_accounts() -> Vec<Value> {
     load_accounts_from_path(&accounts_file())
+}
+
+/// Host commands use the checked read so a damaged index is visible to users.
+pub fn try_load_accounts() -> std::io::Result<Vec<Value>> {
+    AccountRepository::new(&accounts_file()).load()
 }
 
 /// 指定工具存储根下的账号库路径（会话操作等注入路径的场景用）。
@@ -84,12 +85,12 @@ pub fn load_accounts_at(path: &Path) -> Vec<Value> {
     load_accounts_from_path(path)
 }
 
-/// 写回账号库（原子写），保持原 JSON 数组结构。
+/// 写回公开索引与加密凭证（原子发布），保持 JSON 数组外形。
 pub fn save_accounts(accounts: &[Value]) -> std::io::Result<()> {
     save_accounts_to_path(&accounts_file(), accounts)
 }
 
-/// 按 id 或 uid 查找账号。
+/// 仅按本地 id 查找；裸 uid 在不同区域/提供方可能相同，不能用作授权路由。
 pub fn find_account(account_id: &str) -> Option<Value> {
     find_account_in(&load_accounts(), account_id)
 }
@@ -140,10 +141,20 @@ pub fn account_meta(acc: &Value) -> Value {
         "refreshExpiresAt": display_value(acc, "refreshExpiresAt"),
         "refreshedAt": display_value(acc, "refreshedAt"),
         "createdAt": display_value(acc, "createdAt"),
+        "updatedAt": display_value(acc, "updatedAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
-        "needsReloginReason": display_value(acc, "needs_relogin_reason"),
+        "needsReloginReason": if acc.get("needs_relogin").and_then(Value::as_bool) == Some(true) {
+            json!("授权失效或凭证不可读取，请重新登录")
+        } else { Value::Null },
         // 档位随元数据下发，供宿主按档位过滤列表（缺省国内版，历史数据零迁移）。
         "variant": variant_of(acc).as_str(),
+        "provider": account_repository::provider_of(acc),
+        "region": variant_of(acc).as_str(),
+        "is_enabled": acc.get("is_enabled").and_then(Value::as_bool).unwrap_or(true),
+        "status": if acc.get("is_enabled").and_then(Value::as_bool) == Some(false) {
+            "Disabled"
+        } else if desktop_credential_error(acc).is_some() { "NeedsAuthorization" } else { "AvailableForDesktop" },
+        "capabilities": account_repository::capabilities(acc),
     })
 }
 
@@ -211,9 +222,13 @@ fn identity_email(account: &Value) -> Option<String> {
 /// 非空 UID 始终优先；仅当新账号没有 UID 时，才使用真实邮箱兜底。
 /// 命中已有身份时保留本地 id，避免调用方持有的账号引用失效。
 pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value) -> Value {
+    inherit_scope_by_local_id(accounts, &mut collected);
     let collected_uid = get_str(&collected, "uid");
     let collected_email = identity_email(&collected);
     let matches_identity = |existing: &Value| {
+        if !account_repository::same_scope(existing, &collected) {
+            return false;
+        }
         if let Some(uid) = collected_uid.as_deref() {
             return get_str(existing, "uid").as_deref() == Some(uid);
         }
@@ -256,7 +271,12 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
             }
         }
         // 本地展示字段（备注 / 显示选择）不来自官方采集：采集结果缺失时保留已有值。
-        for key in ["note", "displayField"] {
+        for key in [
+            "note",
+            "displayField",
+            "is_enabled",
+            "capability_credentials",
+        ] {
             if collected.get(key).is_none() {
                 if let Some(v) = existing.get(key) {
                     collected[key] = v.clone();
@@ -286,7 +306,9 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
         accounts.insert(first_index.min(accounts.len()), collected.clone());
     } else {
         // 追加分支同样保证入库记录带 id（账号库不允许无 id 记录）。
-        if get_str(&collected, "id").is_none() {
+        if get_str(&collected, "id").is_none()
+            || accounts.iter().any(|v| v["id"] == collected["id"])
+        {
             collected["id"] = Value::String(uuid::Uuid::new_v4().to_string());
         }
         accounts.push(collected.clone());
@@ -297,17 +319,51 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
 
 /// 使用统一身份规则保存采集到的账号。
 pub fn save_collected_account(collected: Value) -> std::io::Result<Value> {
-    let mut accounts = load_accounts();
-    let saved = upsert_collected_account(&mut accounts, collected);
-    save_accounts(&accounts)?;
-    Ok(saved)
+    AccountRepository::new(&accounts_file())
+        .update(|accounts| Ok(upsert_collected_account(accounts, collected)))
 }
 
 /// 按 id 覆盖；id 缺失或未命中时按 uid 回退覆盖，仍未命中则补 id 追加。
 pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
-    let mut accounts = load_accounts();
-    upsert_account_in(&mut accounts, updated);
-    save_accounts(&accounts)
+    AccountRepository::new(&accounts_file()).update(|accounts| {
+        reject_stale_credential_update(accounts, updated)?;
+        upsert_account_in(accounts, updated);
+        Ok(())
+    })
+}
+
+/// An async refresh may finish after a newer login/refresh has been persisted.
+/// Compare opaque references, never token strings, before publishing that result.
+pub fn reject_stale_credential_update(accounts: &[Value], updated: &Value) -> std::io::Result<()> {
+    if let Some(expected) = updated.get("credential_references") {
+        let existing = accounts
+            .iter()
+            .find(|v| v["id"] == updated["id"] && account_repository::same_scope(v, updated));
+        if existing.and_then(|v| v.get("credential_references")) != Some(expected) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "账号凭证已由其他任务更新，请重新加载后重试",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check before backing up/closing a client or changing any official auth file.
+pub fn desktop_credential_error(account: &Value) -> Option<&'static str> {
+    if account.get("is_enabled").and_then(Value::as_bool) == Some(false) {
+        Some("账号已停用，请先启用")
+    } else if account_repository::provider_of(account) != "workbuddy" {
+        Some("此账号的授权提供方不支持 WorkBuddy 桌面切换")
+    } else if account["credential_locked"] == true
+        || account["needs_relogin"] == true
+        || secret_value(account, "access_token").is_none()
+        || account["expiresAt"].as_i64().is_some_and(|v| v <= now_ms())
+    {
+        Some("授权失效或凭证不可读取，请重新登录")
+    } else {
+        None
+    }
 }
 
 /// 备注长度上限（字符数），与前端输入框 maxLength 保持一致。
@@ -318,9 +374,12 @@ const NOTE_MAX_CHARS: usize = 24;
 /// 只触碰本地展示字段，不修改 uid / token / profile_raw 等官方数据。
 /// 先整体校验再写入，避免部分更新。返回更新后的 `account_meta`。
 pub fn update_account_display(account_id: &str, patch: &Value) -> Result<Value, String> {
-    let mut accounts = load_accounts();
-    let updated = update_account_display_in(&mut accounts, account_id, patch)?;
-    save_accounts(&accounts).map_err(|error| error.to_string())?;
+    let updated = AccountRepository::new(&accounts_file())
+        .update(|accounts| {
+            update_account_display_in(accounts, account_id, patch)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })
+        .map_err(|error| error.to_string())?;
     Ok(account_meta(&updated))
 }
 
@@ -363,6 +422,12 @@ pub fn update_account_display_in(
         }
     };
 
+    let enabled_update = match patch.get("is_enabled") {
+        None => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => return Err("启用状态必须为布尔值".to_string()),
+    };
+
     let obj = accounts[index]
         .as_object_mut()
         .ok_or_else(|| "账号记录损坏".to_string())?;
@@ -371,6 +436,9 @@ pub fn update_account_display_in(
     }
     if let Some(field) = field_update {
         obj.insert("displayField".to_string(), field);
+    }
+    if let Some(enabled) = enabled_update {
+        obj.insert("is_enabled".to_string(), json!(enabled));
     }
 
     Ok(accounts[index].clone())
@@ -382,20 +450,24 @@ pub fn update_account_display_in(
 /// 无 id 但有 uid 的历史记录按 uid 覆盖，并在原记录上补 id；新追加记录也补 id。
 /// 两种身份都缺失的旧记录无法在此处安全关联到原行，导入入口会先生成 id。
 fn upsert_account_in(accounts: &mut Vec<Value>, updated: &Value) {
+    let mut updated = updated.clone();
+    inherit_scope_by_local_id(accounts, &mut updated);
+    let updated = &updated;
     let id = get_str(updated, "id");
     let uid = get_str(updated, "uid");
     let id_matched_index = id.as_deref().and_then(|id| {
-        accounts
-            .iter()
-            .position(|a| get_str(a, "id").as_deref() == Some(id))
+        accounts.iter().position(|a| {
+            get_str(a, "id").as_deref() == Some(id) && account_repository::same_scope(a, updated)
+        })
     });
     let uid_matched_index = id_matched_index
         .is_none()
         .then(|| {
             uid.as_deref().and_then(|uid| {
-                accounts
-                    .iter()
-                    .position(|a| get_str(a, "uid").as_deref() == Some(uid))
+                accounts.iter().position(|a| {
+                    get_str(a, "uid").as_deref() == Some(uid)
+                        && account_repository::same_scope(a, updated)
+                })
             })
         })
         .flatten();
@@ -406,7 +478,12 @@ fn upsert_account_in(accounts: &mut Vec<Value>, updated: &Value) {
         inherit_existing_variant(&accounts[index], &mut next);
         // 本地展示字段（备注 / 显示选择）不从官方数据来：updated 缺失时保留已有值。
         if let Some(obj) = next.as_object_mut() {
-            for key in ["note", "displayField"] {
+            for key in [
+                "note",
+                "displayField",
+                "is_enabled",
+                "capability_credentials",
+            ] {
                 if !obj.contains_key(key) {
                     if let Some(v) = accounts[index].get(key) {
                         obj.insert(key.to_string(), v.clone());
@@ -429,10 +506,24 @@ fn upsert_account_in(accounts: &mut Vec<Value>, updated: &Value) {
     }
 
     let mut appended = updated.clone();
-    if get_str(&appended, "id").is_none() {
+    if get_str(&appended, "id").is_none() || accounts.iter().any(|v| v["id"] == appended["id"]) {
         appended["id"] = Value::String(uuid::Uuid::new_v4().to_string());
     }
     accounts.push(appended);
+}
+
+fn inherit_scope_by_local_id(accounts: &[Value], updated: &mut Value) {
+    if get_str(updated, "variant").is_none() && get_str(updated, "domain").is_none() {
+        if let Some(id) = get_str(updated, "id") {
+            if let Some(existing) = accounts.iter().find(|v| {
+                get_str(v, "id").as_deref() == Some(&id)
+                    && account_repository::provider_of(v)
+                        == account_repository::provider_of(updated)
+            }) {
+                updated["variant"] = json!(variant_of(existing).as_str());
+            }
+        }
+    }
 }
 
 /// WorkBuddy 5.6 加密信封凭据的可读错误：`access_token` 为信封形态时返回提示文案。
@@ -540,7 +631,10 @@ mod tests {
         let meta = account_meta(&acc);
         assert_eq!(meta["id"], "a1");
         assert_eq!(meta["needsRelogin"], true);
-        assert_eq!(meta["needsReloginReason"], "刷新失败");
+        assert_eq!(
+            meta["needsReloginReason"],
+            "授权失效或凭证不可读取，请重新登录"
+        );
         assert!(meta.get("access_token").is_none(), "不得泄露 token");
         assert!(meta.get("refresh_token").is_none(), "不得泄露 token");
     }

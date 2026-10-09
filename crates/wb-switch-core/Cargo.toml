@@ -17,6 +17,8 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # 会话关联的内容版本（归一化行摘要 / 全文摘要）。不能改用 DefaultHasher：跨进程
 # 与跨版本都不稳定，无法作为持久化内容身份。
 sha2 = "0.10"
+# Existing locked dependency; serialize account-index updates across hosts.
+fs2 = "0.4"
 
 # CodeBuddy CN IDE Safe Storage (state.vscdb secret inject)
 aes = "0.8"

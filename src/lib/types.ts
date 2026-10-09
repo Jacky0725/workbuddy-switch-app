@@ -28,10 +28,23 @@ export interface AccountMeta {
   refreshExpiresAt: number | null;
   refreshedAt: number | null;
   createdAt: number | null;
+  updatedAt?: number | null;
+  status?: "Disabled" | "NeedsAuthorization" | "AvailableForDesktop";
   needsRelogin: boolean;
   needsReloginReason: string | null;
   /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
   variant?: WbVariant;
+  provider?: string;
+  region?: WbVariant;
+  is_enabled?: boolean;
+  capabilities?: AccountCapability[];
+}
+
+export interface AccountCapability {
+  capability_type: "DesktopSwitch" | "Checkin" | "PointsRead";
+  authorization_status: "AvailableForDesktop" | "NeedsAuthorization" | "Expired" | "CredentialUnavailable" | "Unverified";
+  expires_at: number | null;
+  last_verified_at: number | null;
 }
 
 export interface AppStatus {
@@ -60,23 +73,8 @@ export interface OAuthPollResult {
   error?: string;
 }
 
-/** 导出文件中的完整账号记录（含 token，仅导出命令返回；字段与账号库原始记录一致）。 */
-export interface AccountRecord {
-  id?: string;
-  uid?: string | null;
-  nickname?: string | null;
-  email?: string | null;
-  access_token?: string | null;
-  refresh_token?: string | null;
-  token_type?: string | null;
-  domain?: string | null;
-  expiresAt?: number | null;
-  refreshExpiresAt?: number | null;
-  auth_raw?: unknown;
-  profile_raw?: unknown;
-  createdAt?: number | null;
-  [key: string]: unknown;
-}
+/** 普通导出与列表使用同一公开元数据契约，不含登录凭证。 */
+export type AccountRecord = AccountMeta;
 
 /** 导入文件账号的脱敏预览（不含 token）。 */
 export interface ImportPreviewAccount {

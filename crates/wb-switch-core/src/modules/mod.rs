@@ -1,4 +1,5 @@
 pub mod account;
+pub mod account_repository;
 pub mod auth_file;
 pub mod checkin;
 pub mod codebuddy_cli;
@@ -7,6 +8,7 @@ pub mod codebuddy_ide;
 pub mod codebuddy_ide_session;
 pub mod codebuddy_ide_session_sync;
 pub mod config;
+pub mod credential_store;
 pub mod credit_usage;
 pub mod credits;
 pub mod error_log;

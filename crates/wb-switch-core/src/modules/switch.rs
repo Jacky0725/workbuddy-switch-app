@@ -156,6 +156,9 @@ pub fn switch_account(
     progress("开始切换账号…");
     let acc =
         account::find_account(account_id).ok_or_else(|| format!("账号不存在: {account_id}"))?;
+    if let Some(error) = account::desktop_credential_error(&acc) {
+        return Err(error.to_string());
+    }
     // 档位以账号自身为准：签名里的参数无法表达「用 A 档位操作 B 档位账号」。
     let variant = account::variant_of(&acc);
     let backup = auth_file::backup_auth_file(variant);

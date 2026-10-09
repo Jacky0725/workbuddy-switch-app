@@ -285,8 +285,12 @@ async fn api_status(RawQuery(query): RawQuery) -> Response {
 /// GET /api/accounts —— 返回全部档位的账号，`current` 取请求档位的登录态。
 async fn api_accounts(RawQuery(query): RawQuery) -> Response {
     let variant = query_variant(query.as_deref());
+    let accounts = match account::try_load_accounts() {
+        Ok(accounts) => accounts,
+        Err(error) => return json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    };
     json_ok(json!({
-        "accounts": account::load_accounts()
+        "accounts": accounts
             .iter()
             .map(account::account_meta)
             .collect::<Vec<_>>(),

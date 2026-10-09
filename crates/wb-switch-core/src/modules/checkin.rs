@@ -144,6 +144,11 @@ async fn checkin_request_once(path: &str, account: &Value, variant: WbVariant) -
     if let Some(err) = envelope_token_error(account) {
         return json!({"code": -2, "message": err});
     }
+    if let Some(error) = crate::modules::account_repository::api_capability_error(
+        crate::modules::credential_store::CapabilityType::Checkin,
+    ) {
+        return json!({"code": -3, "message": error});
+    }
     let url = format!("{}{path}", variant.api_endpoint());
     let headers = build_auth_headers(account);
     let mut resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
@@ -305,6 +310,14 @@ fn decide_from_status(status: &Value) -> StatusDecision {
 
 /// 对单个账号执行完整签到流程：惰性刷新 → 查状态 → 未签到时提交 → 写提交日志。
 pub async fn checkin_account(account: &Value) -> Value {
+    if variant_of(account).supports_checkin() {
+        if let Some(error) = crate::modules::account_repository::api_capability_error(
+            crate::modules::credential_store::CapabilityType::Checkin,
+        ) {
+            // Gate before ensure_fresh_token: even a refresh would be a real request.
+            return json!({"result": "skipped", "reason": "authorization_unverified", "error": error});
+        }
+    }
     let Some(_account_guard) = AccountRunGuard::try_acquire(account) else {
         return json!({"result": "error", "error": "该账号正在签到，请稍后再试"});
     };

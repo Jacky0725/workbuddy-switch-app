@@ -57,7 +57,7 @@ function revealLabel(): string {
   return "在 Finder 中显示";
 }
 
-/** 导出账号弹框：多选账号 → 后端导出完整记录（含 token）→ 下载 JSON。 */
+/** 导出公开元数据；后台不将登录凭证发送到前端。 */
 export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported }: Props) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
@@ -132,7 +132,7 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported 
         <Alert variant="warning">
           <AlertTitle>安全提示</AlertTitle>
           <AlertDescription>
-            导出文件含登录 token，等同密码，请勿上传网盘或发送给他人。
+            导出文件仅包含账号资料，不含登录凭证，不能用来恢复登录。资料可能包含邮箱和手机号，请妥善保管。
           </AlertDescription>
         </Alert>
 

@@ -1,4 +1,4 @@
-//! 账号导出/导入：解析导入文件、按 uid 去重合并、计数。
+//! 账号公开导出与显式凭证导入：按提供方/区域/uid 去重，保持稳定本地 id。
 //!
 //! 纯逻辑（`parse_accounts_json` / `merge_import_records` / `select_export_records`）
 //! 不依赖文件系统，便于无 UI 环境单测；`export_accounts` / `import_accounts`
@@ -87,15 +87,20 @@ fn merge_import_record(accounts: &mut Vec<Value>, item: &Value) -> MergeOutcome 
         return MergeOutcome::Skipped;
     }
     if let Some(uid) = account::get_str(item, "uid").as_deref() {
-        if let Some(existing) = accounts
-            .iter_mut()
-            .find(|a| account::get_str(a, "uid").as_deref() == Some(uid))
-        {
+        if let Some(existing) = accounts.iter_mut().find(|a| {
+            account::get_str(a, "uid").as_deref() == Some(uid)
+                && crate::modules::account_repository::same_scope(a, item)
+        }) {
             let mut replaced = item.clone();
             // 本地展示字段（备注 / 显示选择）：备份未携带时保留本地值；
             // 备份自带则以备份为准（导入即恢复用户当时的展示配置）。
             if let Some(obj) = replaced.as_object_mut() {
-                for key in ["note", "displayField"] {
+                for key in [
+                    "note",
+                    "displayField",
+                    "is_enabled",
+                    "capability_credentials",
+                ] {
                     if !obj.contains_key(key) {
                         if let Some(v) = existing.get(key) {
                             obj.insert(key.to_string(), v.clone());
@@ -105,11 +110,9 @@ fn merge_import_record(accounts: &mut Vec<Value>, item: &Value) -> MergeOutcome 
             }
             // 账号库不允许出现无 id 记录（删除按 id、列表 key、导出选择都依赖
             // id）：优先保留本地 id；本地也是无 id 的历史脏数据时补一个。
-            if account::get_str(&replaced, "id").is_none() {
-                replaced["id"] = account::get_str(existing, "id")
-                    .map(Value::String)
-                    .unwrap_or_else(|| Value::String(uuid::Uuid::new_v4().to_string()));
-            }
+            replaced["id"] = account::get_str(existing, "id")
+                .map(Value::String)
+                .unwrap_or_else(|| Value::String(uuid::Uuid::new_v4().to_string()));
             *existing = replaced;
             return MergeOutcome::Overwritten;
         }
@@ -117,7 +120,9 @@ fn merge_import_record(accounts: &mut Vec<Value>, item: &Value) -> MergeOutcome 
     // 追加同样必须带 id：缺 id 的记录在刷新回写时无法被按 id 覆盖，会被
     // 反复追加副本（issue #111）。
     let mut appended = item.clone();
-    if account::get_str(&appended, "id").is_none() {
+    if account::get_str(&appended, "id").is_none()
+        || accounts.iter().any(|v| v["id"] == appended["id"])
+    {
         appended["id"] = Value::String(uuid::Uuid::new_v4().to_string());
     }
     accounts.push(appended);
@@ -152,13 +157,17 @@ pub fn merge_import_records(
 
 /// 导入：读账号库 → 合并 → 写回，返回计数。
 pub fn import_accounts(text: &str, indexes: &[usize]) -> Result<ImportResult, String> {
-    let mut accounts = account::load_accounts();
-    let result = merge_import_records(&mut accounts, text, indexes)?;
-    account::save_accounts(&accounts).map_err(|e| format!("保存账号库失败：{e}"))?;
-    Ok(result)
+    crate::modules::account_repository::AccountRepository::new(
+        &crate::modules::config::accounts_file(),
+    )
+    .update(|accounts| {
+        merge_import_records(accounts, text, indexes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    })
+    .map_err(|e| format!("保存账号库失败：{e}"))
 }
 
-/// 纯函数：从账号列表中挑出 id 命中的完整记录（含 token）。
+/// 普通导出只含公开元数据；未知字段也不得透传。
 pub fn select_export_records(accounts: &[Value], ids: &[String]) -> Result<Vec<Value>, String> {
     let ids: Vec<&str> = ids
         .iter()
@@ -174,7 +183,7 @@ pub fn select_export_records(accounts: &[Value], ids: &[String]) -> Result<Vec<V
             .iter()
             .find(|a| a.get("id").and_then(|v| v.as_str()) == Some(id))
         {
-            exported.push(acc.clone());
+            exported.push(account::account_meta(acc));
         }
     }
     if exported.is_empty() {
@@ -183,9 +192,12 @@ pub fn select_export_records(accounts: &[Value], ids: &[String]) -> Result<Vec<V
     Ok(exported)
 }
 
-/// 导出：按账号 id 列表返回完整记录（含 token）。
+/// 导出：返回公开元数据，不包含凭证或原始授权响应。
 pub fn export_accounts(ids: &[String]) -> Result<Vec<Value>, String> {
-    select_export_records(&account::load_accounts(), ids)
+    select_export_records(
+        &account::try_load_accounts().map_err(|e| e.to_string())?,
+        ids,
+    )
 }
 
 /// 导出文件名白名单：只允许 `wb-switch-accounts-YYYY-MM-DD.json` 这类由前端生成的文件名。
@@ -226,17 +238,21 @@ pub fn write_records_to_file(
     file_name: &str,
 ) -> Result<String, String> {
     validate_export_file_name(file_name)?;
-    let content = serde_json::to_string_pretty(records).map_err(|e| e.to_string())?;
+    let metadata: Vec<Value> = records.iter().map(account::account_meta).collect();
+    let content = serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())?;
     let path = dir.join(file_name);
     crate::modules::config::atomic_write(&path, &content)
         .map_err(|e| format!("写入导出文件失败：{e}"))?;
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// 导出：按账号 id 列表把完整记录写入用户选择的路径（保存对话框产物），返回该路径。
+/// 导出：把公开元数据写入用户选择的路径；登录凭证不属于普通导出。
 pub fn export_accounts_to_path(ids: &[String], path: &str) -> Result<String, String> {
     validate_export_path(path)?;
-    let records = select_export_records(&account::load_accounts(), ids)?;
+    let records = select_export_records(
+        &account::try_load_accounts().map_err(|e| e.to_string())?,
+        ids,
+    )?;
     let path_buf = PathBuf::from(path.trim());
     let content = serde_json::to_string_pretty(&records).map_err(|e| e.to_string())?;
     crate::modules::config::atomic_write(&path_buf, &content)
@@ -293,7 +309,7 @@ mod tests {
         assert_eq!(result.overwritten, 1);
         assert_eq!(result.skipped, 0);
         assert_eq!(accounts.len(), 1, "同 uid 应覆盖而不是新增");
-        assert_eq!(accounts[0]["id"], "imported", "覆盖保留导入记录原样");
+        assert_eq!(accounts[0]["id"], "local", "同身份导入必须保留本地稳定 id");
         assert_eq!(accounts[0]["nickname"], "新名称");
         assert_eq!(accounts[0]["access_token"], "tok-new");
     }
@@ -393,7 +409,7 @@ mod tests {
         assert_eq!(result.imported, 2);
         assert_eq!(result.overwritten, 1);
         assert_eq!(accounts.len(), 1, "文件内重复 uid 也不得产生重复账号");
-        assert_eq!(accounts[0]["id"], "f2");
+        assert_eq!(accounts[0]["id"], "f1", "同身份导入保留第一次建立的本地 id");
     }
 
     /// 回归 issue #111：导入记录缺 id 时必须补一个，否则刷新回写会反复追加副本。
@@ -460,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn export_returns_full_records_with_tokens() {
+    fn export_returns_metadata_without_tokens() {
         let accounts = vec![
             record("a1", Some("u1"), "甲", Some("a@b.c"), true),
             record("a2", Some("u2"), "乙", None, true),
@@ -469,7 +485,7 @@ mod tests {
             select_export_records(&accounts, &["a1".to_string(), "missing".to_string()]).unwrap();
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0]["id"], "a1");
-        assert_eq!(exported[0]["access_token"], "token-a1");
+        assert!(exported[0].get("access_token").is_none());
     }
 
     #[test]
@@ -488,14 +504,9 @@ mod tests {
         let text = serde_json::to_string(&exported).unwrap();
         let mut target: Vec<Value> = vec![];
         let result = merge_import_records(&mut target, &text, &[0]).unwrap();
-        assert_eq!(result.imported, 1);
-        assert_eq!(target.len(), 1);
-        assert_eq!(
-            target[0]["access_token"], "tok-1",
-            "round-trip 保留 access_token"
-        );
-        assert_eq!(target[0]["refresh_token"], "ref-1");
-        assert_eq!(target[0]["auth_raw"]["k"], "v");
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.skipped, 1);
+        assert!(target.is_empty(), "公开元数据不能冒充可恢复登录的凭证备份");
     }
 
     #[test]
@@ -592,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn export_accounts_to_file_writes_json_with_tokens() {
+    fn export_accounts_to_file_writes_metadata_without_tokens() {
         let dir = std::env::temp_dir();
         let file_name = format!(
             "wb-switch-accounts-test-{}.json",
@@ -604,7 +615,10 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(written.len(), 1);
-        assert_eq!(written[0]["access_token"], "token-a1", "导出文件保留 token");
+        assert!(
+            written[0].get("access_token").is_none(),
+            "普通导出不得保留 token"
+        );
     }
 
     #[test]
