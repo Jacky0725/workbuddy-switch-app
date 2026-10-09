@@ -505,3 +505,48 @@ async fn redirects_cannot_escape_to_another_server() {
     assert_eq!(f.calls.lock().unwrap().len(), 1);
     f.assert_drained();
 }
+
+#[tokio::test]
+async fn persistent_scheduler_uses_the_http_engine_and_does_not_repeat_after_restart() {
+    use chrono::TimeZone;
+    use wb_switch_core::modules::daily_scheduler::{
+        Clock, DailyScheduler, SchedulerConfig, TaskState,
+    };
+    struct FrozenClock;
+    impl Clock for FrozenClock {
+        fn now_ms(&self) -> i64 {
+            chrono::Utc
+                .with_ymd_and_hms(2026, 10, 9, 1, 15, 0)
+                .unwrap()
+                .timestamp_millis()
+        }
+    }
+    struct StateDir(std::path::PathBuf);
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir =
+        StateDir(std::env::temp_dir().join(format!("wbm-http-scheduler-{}", uuid::Uuid::new_v4())));
+    let f = Fixture::new(vec![step("status", 200, NO), step("submit", 200, SUCCESS)]);
+    let config = SchedulerConfig {
+        enabled: true,
+        ..SchedulerConfig::default()
+    };
+    let scheduler = DailyScheduler::new(&dir.0, config.clone(), FrozenClock, f.service()).unwrap();
+    let result = scheduler
+        .tick(&[account("a")], &CancellationToken::default())
+        .await
+        .unwrap();
+    assert_eq!(result.executed[0].state, TaskState::Finished(S::Success));
+    let restarted = DailyScheduler::new(&dir.0, config, FrozenClock, f.service()).unwrap();
+    assert!(restarted
+        .tick(&[account("a")], &CancellationToken::default())
+        .await
+        .unwrap()
+        .executed
+        .is_empty());
+    assert_eq!(f.count("/submit"), 1);
+    f.assert_drained();
+}

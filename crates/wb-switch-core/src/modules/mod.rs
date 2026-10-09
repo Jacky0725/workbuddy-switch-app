@@ -12,6 +12,7 @@ pub mod config;
 pub mod credential_store;
 pub mod credit_usage;
 pub mod credits;
+pub mod daily_scheduler;
 pub mod error_log;
 pub mod export_import;
 pub mod jetbrains;
