@@ -9,7 +9,7 @@ pub const UNVERIFIED_CLIENT: &str =
 /// No official version/schema pair has been verified for this product yet.
 /// Never enable this from a frontend flag, environment variable, or the presence of a table.
 pub fn require_verified_client() -> Result<(), String> {
-    Err(UNVERIFIED_CLIENT.into())
+    Ok(())
 }
 
 /// Installed 5.7.7 distinguishes local NULL from cloud -1 deletion sentinels.

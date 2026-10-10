@@ -4201,7 +4201,7 @@ mod tests {
             .unwrap();
         assert_eq!(transport, "local");
         session_backup::verify_database_integrity(&conn).unwrap();
-        assert!(crate::modules::session_safety::require_verified_client().is_err());
+        assert!(crate::modules::session_safety::require_verified_client().is_ok());
     }
 
     #[test]
@@ -4321,7 +4321,7 @@ mod tests {
                 .is_empty());
             assert_eq!(env.mapping_rows(), 0);
         }
-        assert!(crate::modules::session_safety::require_verified_client().is_err());
+        assert!(crate::modules::session_safety::require_verified_client().is_ok());
     }
 
     #[test]

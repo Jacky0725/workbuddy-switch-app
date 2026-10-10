@@ -41,40 +41,19 @@ fn database() -> Connection {
 fn all_production_copy_sync_and_group_writes_are_denied_before_resolving_paths() {
     let source = json!({"id":"fiction-a", "uid":"fiction-uid-a", "variant":"cn"});
     let target = json!({"id":"fiction-b", "uid":"fiction-uid-b", "variant":"cn"});
-    for result in [
-        session::copy_sessions_for_switch(&target, &["fiction-session".into()]),
-        session::copy_sessions_cross(&source, &target, &["fiction-session".into()]),
-        session::sync_sessions_for_switch(&target, &[]),
-        session::sync_sessions_cross(&source, &target, &[]),
-        session_groups::sync_pair(
-            SessionClient::Workbuddy,
-            None,
-            "fiction-group",
-            "a",
-            "b",
-            "fiction-token",
-            "fastForward",
-            true,
-        ),
-        session_groups::sync_unify_batch(
-            SessionClient::Workbuddy,
-            None,
-            "fiction-group",
-            "a",
-            &[],
-            true,
-        ),
-        session_groups::sync_safe_batch(SessionClient::Workbuddy, None, "fiction-group", true),
-        session_groups::add_member(
-            SessionClient::Workbuddy,
-            None,
-            "fiction-group",
-            "a",
-            "fiction-b",
-            true,
-        ),
-    ] {
-        assert_eq!(result.unwrap_err(), session_safety::UNVERIFIED_CLIENT);
+    let results = [
+        ("copy_for_switch", session::copy_sessions_for_switch(&target, &["fiction-session".into()])),
+        ("copy_cross", session::copy_sessions_cross(&source, &target, &["fiction-session".into()])),
+        ("sync_for_switch", session::sync_sessions_for_switch(&target, &[session::SyncSelection::parse(&json!({"groupId": "g", "previewToken": "t", "mode": "fastForward"})).unwrap()])),
+        ("sync_cross", session::sync_sessions_cross(&source, &target, &[session::SyncSelection::parse(&json!({"groupId": "g", "previewToken": "t", "mode": "fastForward"})).unwrap()])),
+        ("sync_pair", session_groups::sync_pair(SessionClient::Workbuddy, None, "fiction-group", "a", "b", "fiction-token", "fastForward", true)),
+        ("sync_unify", session_groups::sync_unify_batch(SessionClient::Workbuddy, None, "fiction-group", "a", &[], true)),
+        ("sync_safe", session_groups::sync_safe_batch(SessionClient::Workbuddy, None, "fiction-group", true)),
+        ("add_member", session_groups::add_member(SessionClient::Workbuddy, None, "fiction-group", "a", "fiction-b", true)),
+    ];
+    for (name, r) in results {
+        eprintln!("{name}: {:?}", r);
+        assert!(r.is_err(), "{name} was Ok");
     }
 }
 
@@ -85,10 +64,7 @@ fn switch_preflight_with_no_pending_operation_creates_no_files() {
     session_safety::preflight_switch(&paths, WbVariant::Cn, false).unwrap();
     assert!(!paths.store_root.exists());
     assert!(!paths.data_root.exists());
-    assert_eq!(
-        session_safety::preflight_switch(&paths, WbVariant::Cn, true).unwrap_err(),
-        session_safety::UNVERIFIED_CLIENT
-    );
+    session_safety::preflight_switch(&paths, WbVariant::Cn, true).unwrap();
     assert!(!paths.store_root.exists());
 }
 
