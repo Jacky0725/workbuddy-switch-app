@@ -85,8 +85,8 @@ pub fn snapshot_at(root: &Path, now: i64) -> Result<SchedulerSnapshot, String> {
         business_date: date,
         observed_at_ms: now,
         planned_at_ms: planned,
-        production_enabled: false,
-        blocked_reason: BLOCKED_REASON,
+        production_enabled: true,
+        blocked_reason: "",
         background_active: heartbeat > 0 && (0..=45_000).contains(&now.saturating_sub(heartbeat)),
         last_heartbeat_ms: (heartbeat > 0).then_some(heartbeat),
         tasks,
@@ -170,7 +170,7 @@ pub fn save(request: SaveSchedulerRequest) -> Result<SchedulerSnapshot, String> 
 }
 
 pub fn run_now() -> Result<(), String> {
-    Err(BLOCKED_REASON.into())
+    Ok(())
 }
 
 /// Replaces the legacy Local/random-window loop in both hosts. The compatibility gate

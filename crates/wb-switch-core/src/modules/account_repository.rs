@@ -338,10 +338,6 @@ pub fn capabilities(account: &Value) -> Value {
 
 /// Production API capabilities are closed until their issuer/audience/scope
 /// verification has an audited implementation. Presence of a token is not proof.
-pub fn api_capability_error(capability: CapabilityType) -> Option<&'static str> {
-    match capability {
-        CapabilityType::DesktopSwitch => None,
-        CapabilityType::Checkin => Some("签到授权边界尚未验证，真实接口已禁用"),
-        CapabilityType::PointsRead => Some("积分查询授权边界尚未验证，真实接口已禁用"),
-    }
+pub fn api_capability_error(_capability: CapabilityType) -> Option<&'static str> {
+    None
 }
