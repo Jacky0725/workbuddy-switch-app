@@ -1348,10 +1348,14 @@ pub(crate) fn relaunch_app_inner<R: tauri::Runtime>(
 
 /// GET /api/launch-at-login —— 查询系统当前的开机自启注册状态。
 ///
-/// 以 tauri-plugin-autostart 的 OS 状态为唯一事实来源，不另存本地布尔值。
+/// 以 OS 注册和系统启停状态为事实来源，不另存本地布尔值。
 #[tauri::command]
 pub fn get_launch_at_login_enabled(_app: tauri::AppHandle) -> Result<bool, String> {
-    #[cfg(desktop)]
+    #[cfg(target_os = "windows")]
+    {
+        return crate::windows_autostart::is_enabled();
+    }
+    #[cfg(all(desktop, not(target_os = "windows")))]
     {
         use tauri_plugin_autostart::ManagerExt;
         _app.autolaunch()
@@ -1388,7 +1392,11 @@ mod relaunch_tests {
 /// 回读结果与请求值不一致时按失败处理并返回当前真实状态，避免假装设置成功。
 #[tauri::command]
 pub fn set_launch_at_login_enabled(_app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
-    #[cfg(desktop)]
+    #[cfg(target_os = "windows")]
+    {
+        return crate::windows_autostart::set_enabled(enabled);
+    }
+    #[cfg(all(desktop, not(target_os = "windows")))]
     {
         use tauri_plugin_autostart::ManagerExt;
         let autostart = _app.autolaunch();

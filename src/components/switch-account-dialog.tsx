@@ -17,6 +17,7 @@ import { DialogAutoHeight } from "@/components/ui/dialog-auto-height";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { SessionSyncSection, type SessionLinksMeta } from "@/components/session-sync-section";
+import { SessionTransferNotice } from "@/components/session-transfer-notice";
 import { SessionTreeList } from "@/components/session-tree";
 import * as api from "@/lib/api";
 import { displayName } from "@/lib/account-display";
@@ -525,6 +526,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             </Alert>
           )}
 
+          <SessionTransferNotice />
           {linksAvailable ? (
             <Tabs
               value={tab}

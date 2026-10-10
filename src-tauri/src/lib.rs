@@ -6,6 +6,8 @@ mod instance_lock;
 #[cfg(desktop)]
 mod tray;
 mod update_service;
+#[cfg(target_os = "windows")]
+mod windows_autostart;
 
 use tauri::Emitter;
 use wb_switch_core::modules;
@@ -87,10 +89,13 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec![tray::SILENT_STARTUP_ARG]),
-        ));
+        #[cfg(not(target_os = "windows"))]
+        {
+            builder = builder.plugin(tauri_plugin_autostart::init(
+                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                Some(vec![tray::SILENT_STARTUP_ARG]),
+            ));
+        }
         builder = builder.on_window_event(tray::on_window_event);
     }
 

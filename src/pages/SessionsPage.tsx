@@ -18,6 +18,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { displayName } from "@/lib/account-display";
+import { SessionTransferNotice } from "@/components/session-transfer-notice";
 import * as api from "@/lib/api";
 import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, WbVariant } from "@/lib/types";
 import { accountVariant, variantLabel } from "@/lib/variant";
@@ -534,8 +535,9 @@ export default function SessionsPage() {
         </header>
         {client === "workbuddy" && !api.isDemoMode() && <Alert className="mb-5">
           <AlertTitle>会话写入等待兼容性验证</AlertTitle>
-          <AlertDescription>当前客户端版本与数据库结构尚未验证，复制和同步已暂停。通过验证后才能写入会话。</AlertDescription>
+          <AlertDescription>官方客户端业务兼容性尚未通过验收，复制和同步已暂停。云会话、Buddy 快照和官方分组绑定暂不支持迁移。</AlertDescription>
         </Alert>}
+        <div className="mb-5"><SessionTransferNotice /></div>
         <section aria-labelledby="session-groups-title" className="min-w-0">
           <div className="mb-4 flex flex-wrap items-center gap-2">
             <h2 id="session-groups-title" className="text-base font-semibold tracking-tight">{CLIENTS.find((item) => item.id === client)?.title} 会话</h2>
