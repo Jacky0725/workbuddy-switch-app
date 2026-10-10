@@ -12,6 +12,57 @@ pub fn require_verified_client() -> Result<(), String> {
     Err(UNVERIFIED_CLIENT.into())
 }
 
+/// Installed 5.7.7 distinguishes local NULL from cloud -1 deletion sentinels.
+/// Reject unsupported bindings rather than cloning or silently stripping them.
+/// Older fictional schemas without transport remain testable; this never grants
+/// a production version/schema permission (require_verified_client stays closed).
+pub(crate) fn validate_local_transfer_row(
+    row: &[(String, rusqlite::types::Value)],
+) -> Result<(), String> {
+    validate_local_transfer_kind(row)?;
+    let deleted = row
+        .iter()
+        .find(|(key, _)| key == "deleted_at")
+        .map(|(_, value)| value);
+    if !matches!(deleted, Some(rusqlite::types::Value::Null)) {
+        return Err("已删除或删除状态无法确认的会话不支持迁移写入".into());
+    }
+    Ok(())
+}
+
+/// Recovery may roll back a deleted local row's body. It must still never mutate
+/// cloud/Buddy/group-bound bodies using the legacy local recovery algorithm.
+pub(crate) fn validate_local_transfer_kind(
+    row: &[(String, rusqlite::types::Value)],
+) -> Result<(), String> {
+    use rusqlite::types::Value;
+    let field = |name: &str| {
+        row.iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    };
+    if let Some(transport) = field("transport") {
+        if !matches!(transport, Value::Text(value) if value == "local") {
+            return Err("云会话或未知传输类型暂不支持复制、同步或恢复写入".into());
+        }
+    }
+    for name in [
+        "buddy_snapshot_id",
+        "buddy_binding_json",
+        "group_id",
+        "group_title",
+    ] {
+        if let Some(value) = field(name) {
+            if !matches!(value, Value::Null)
+                && !matches!(value, Value::Text(text) if text.is_empty())
+            {
+                return Err("会话含 Buddy 快照或官方分组绑定，尚未验证完整迁移，已停止写入".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Inspect manager-owned operation records before closing the client or backing up auth.
 /// Plain account switching can proceed only when it needs no session recovery/write.
 pub fn preflight_switch(

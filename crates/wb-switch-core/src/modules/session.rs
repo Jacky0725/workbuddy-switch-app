@@ -1,4 +1,4 @@
-//! 会话列表与按需复制（路径 B：生成新 id，云端可正常同步）。
+//! 会话列表与按需复制（路径 B：生成新 id，生产兼容性尚未放行）。
 //!
 //! 对照 server.py `current_user_uid` / `list_sessions_for_user` /
 //! `_find_project_jsonl` / `copy_session_to_user` / `_register_edge_sync_mapping` /
@@ -10,8 +10,8 @@
 //!   3) 云端映射：`~/.workbuddy/edge-sync-mapping-v{N}.db` edge_sync_mapping
 //!      （文件名版本号由客户端演进，按最大版本号动态发现）
 //!      （session_id=conversation_id，msg_channel=convmsg:{uid} 决定云端归属）
-//!      **不由本工具写入**：复制只写 1)、2)，映射行由 edge-sync 扩展在客户端下次
-//!      启动迁移副本时自行写入（预写会让客户端判定"已迁移"跳过上传，云端缺会话）。
+//!      **不由本工具写入**：保留上游让客户端接管映射的设计，但官方 5.7.7 的
+//!      接管、上传与附件行为尚未验收，不能据此宣称云同步兼容。
 //!
 //! 复制收口（design §4）：所有复制入口统一走 [`copy_sessions_for_switch`]，在同一把
 //! 档位操作锁内先恢复未完成操作、再查询关联组；同一逻辑会话只保留一个有效副本，
@@ -573,6 +573,8 @@ fn insert_session_copy(
         return Ok(DbCopyOutcome::SourceRowMissing);
     };
 
+    crate::modules::session_safety::validate_local_transfer_row(&source_row)?;
+
     let Some(mut conn) = open_db(&dst_db, false) else {
         return Err("会话数据无法打开".to_string());
     };
@@ -647,13 +649,57 @@ fn read_source_session_row(
         .into_iter()
         .enumerate()
         .map(|(i, col)| {
-            let value = row
-                .get::<_, rusqlite::types::Value>(i)
-                .unwrap_or(rusqlite::types::Value::Null);
-            (col, value)
+            let value = row.get::<_, rusqlite::types::Value>(i)?;
+            Ok((col, value))
         })
-        .collect();
+        .collect::<Result<Vec<_>, rusqlite::Error>>()
+        .map_err(|error| error.to_string())?;
     Ok(Some(values))
+}
+
+/// Inspect a row's transfer metadata without reading its JSONL body. Missing rows
+/// are handled by the caller's existing ownership/recovery rules.
+fn read_existing_transfer_row(
+    paths: &SessionPaths,
+    cid: &str,
+) -> Result<Option<Vec<(String, rusqlite::types::Value)>>, String> {
+    if !paths.workbuddy_db().is_file() {
+        return Ok(None);
+    }
+    let conn = open_db(&paths.workbuddy_db(), true)
+        .ok_or_else(|| "会话数据无法打开，无法验证迁移类型".to_string())?;
+    if !table_exists(&conn, "sessions") {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare("SELECT * FROM sessions WHERE id=?1")
+        .map_err(|_| "会话记录无法读取，无法验证迁移类型".to_string())?;
+    let columns: Vec<String> = stmt
+        .column_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    let mut rows = stmt.query([cid]).map_err(|error| error.to_string())?;
+    let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let values = columns
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| {
+            row.get::<_, rusqlite::types::Value>(index)
+                .map(|value| (name, value))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    Ok(Some(values))
+}
+
+fn validate_existing_transfer_row(paths: &SessionPaths, cid: &str) -> Result<(), String> {
+    if let Some(row) = read_existing_transfer_row(paths, cid)? {
+        crate::modules::session_safety::validate_local_transfer_row(&row)?;
+    }
+    Ok(())
 }
 
 /// 目标 sessions 表的列名（按表自身列序）。
@@ -1173,6 +1219,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         ));
     }
 
+    validate_existing_transfer_row(context.source_paths, cid)?;
     // 源正文与源行都在源档（跨档时与目标档不同）。
     let Some(source_path) = find_project_jsonl(context.source_paths, cid) else {
         return Err("会话内容不存在，未复制".to_string());
@@ -2004,7 +2051,12 @@ fn preview_group_item(
     let target_content = member_content_state(&target_paths, &target_member.session_id);
     let rows_match = member_row_owned_by(&source_paths, source_member)
         && member_row_owned_by(&target_paths, target_member);
-    let decision = if rows_match {
+    let transfer_problem = validate_existing_transfer_row(&source_paths, &source_member.session_id)
+        .and_then(|_| validate_existing_transfer_row(&target_paths, &target_member.session_id))
+        .err();
+    let decision = if let Some(reason) = transfer_problem {
+        SyncDecision::unknown(reason)
+    } else if rows_match {
         session_link::decide_sync(&source_content, &target_content, &baseline)
     } else {
         // 会话行缺失/归属异常：成员实际已失效，与内容不可验证同等对待。
@@ -2164,6 +2216,11 @@ fn plan_sync_selection(
         || !member_row_owned_by(paths, target_member)
     {
         return skip("会话记录缺失或归属异常，检查结果已失效".to_string());
+    }
+    if let Err(message) = validate_existing_transfer_row(source_paths, &source_member.session_id)
+        .and_then(|_| validate_existing_transfer_row(paths, &target_member.session_id))
+    {
+        return SyncItemOutcome::Rejected { message };
     }
     // 重新加载正文、基线与判定，再与凭据逐项核对；任一变化都跳过（含显式覆盖）。
     let source_content = member_content_state(source_paths, &source_member.session_id);
@@ -3090,6 +3147,9 @@ fn update_target_session_row(
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("会话数据事务开启失败：{error}"))?;
+    if let Some(row) = read_source_session_row(&tx, &target.session_id, &target.uid)? {
+        crate::modules::session_safety::validate_local_transfer_row(&row)?;
+    }
     let affected = tx
         .execute(
             "UPDATE sessions SET updated_at = ?1 \
@@ -3242,6 +3302,7 @@ fn run_sync_phases(
     manifest: &SyncBackupManifest,
     body: SyncBodyState,
 ) -> Result<(), String> {
+    validate_existing_transfer_row(paths, &operation.target.session_id)?;
     let normalized = match body {
         // 已写入：只核验现场，不重写。
         SyncBodyState::Ours => {
@@ -3322,6 +3383,8 @@ fn execute_sync_item(
                 .unwrap_or_else(|| "等待恢复".to_string())
         ));
     }
+    validate_existing_transfer_row(context.source_paths, &plan.source_member.session_id)?;
+    validate_existing_transfer_row(paths, &plan.target_member.session_id)?;
     let target_body_path = find_project_jsonl(paths, &plan.target_member.session_id)
         .ok_or_else(|| "目标内容不存在，未同步".to_string())?;
     crate::modules::session_safety::preflight_target_database(paths)?;
@@ -3624,6 +3687,16 @@ fn recover_sync_operation(paths: &SessionPaths, mut operation: Operation) -> Rec
     if let Err(reason) = verify_sync_backup(&backup_dir, &manifest) {
         return needs(reason, false);
     }
+    match read_existing_transfer_row(paths, &operation.target.session_id) {
+        Ok(Some(row)) => {
+            if let Err(reason) = crate::modules::session_safety::validate_local_transfer_kind(&row)
+            {
+                return needs(reason, false);
+            }
+        }
+        Ok(None) => {}
+        Err(reason) => return needs(reason, false),
+    }
     let target_body_path = match validated_target_body_path(paths, &manifest) {
         Ok(path) => path,
         Err(reason) => return needs(reason, false),
@@ -3722,6 +3795,12 @@ fn recover_copy_operation(
     };
     // 读侧数据根：跨档操作由调用方解析出的源档；同档与旧记录用目标档。
     let read_paths = source_paths.unwrap_or(paths);
+
+    if let Err(reason) = validate_existing_transfer_row(read_paths, &operation.source.session_id)
+        .and_then(|_| validate_existing_transfer_row(paths, &operation.target.session_id))
+    {
+        return needs(reason, false);
+    }
 
     // 1) 目标正文：已写成则直接复用；未写成则用当前源内容补写；被改动则停止。
     let normalized = match check_target_body(paths, &operation) {
@@ -4194,15 +4273,37 @@ mod tests {
         session_backup::verify_database_integrity(&conn).unwrap();
     }
 
-    // Characterization, NOT approval: the retained algorithm copies these bindings unchanged.
-    // Their official cross-account meaning is unknown; the production gate must stay closed.
     #[test]
-    fn workbuddy_577_legacy_copy_preserves_unverified_cloud_and_snapshot_bindings() {
-        let env = workbuddy_577_env("577-cloud-characterization");
-        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
-        conn.execute("UPDATE sessions SET transport='cloud',group_id='fiction-cloud-group',buddy_snapshot_id='fiction-snapshot',buddy_binding_json='{}' WHERE id='sess-1'", []).unwrap();
-        assert_eq!(
-            insert_session_copy(
+    fn workbuddy_577_unsupported_copy_rejects_before_body_backup_and_row_writes() {
+        for assignment in [
+            "transport='cloud'",
+            "transport='cloud',deleted_at=-1",
+            "transport='unknown'",
+            "transport=x'6c6f63616c'",
+            "transport=42",
+            "deleted_at=123",
+            "deleted_at=-1",
+            "buddy_snapshot_id='fiction-snapshot'",
+            "buddy_binding_json='{}'",
+            "group_id='fiction-group'",
+            "group_title='fiction-title'",
+        ] {
+            let env = workbuddy_577_env("577-reject-copy");
+            let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+            conn.execute_batch(&format!(
+                "UPDATE sessions SET {assignment} WHERE id='sess-1'"
+            ))
+            .unwrap();
+            drop(conn);
+            let db_before = std::fs::read(env.paths.workbuddy_db()).unwrap();
+            let body_before = body_bytes(&env, "sess-1");
+            let report = copy(&env, "uid-b", &["sess-1"]);
+            assert!(
+                report["copied"].as_array().unwrap().is_empty(),
+                "{assignment}: {report}"
+            );
+            assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+            assert!(insert_session_copy(
                 &env.paths,
                 &env.paths,
                 "fiction-copy",
@@ -4210,35 +4311,108 @@ mod tests {
                 "uid-a",
                 "uid-b"
             )
-            .unwrap(),
-            DbCopyOutcome::Inserted
-        );
-        let bindings: (String, String, String) = conn
-            .query_row(
-                "SELECT transport,group_id,buddy_snapshot_id FROM sessions WHERE id='fiction-copy'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            .is_err());
+            assert_eq!(std::fs::read(env.paths.workbuddy_db()).unwrap(), db_before);
+            assert_eq!(body_bytes(&env, "sess-1"), body_before);
+            assert_eq!(env.body_files().len(), 1);
+            assert!(!env.paths.backup_root().exists());
+            assert!(session_link::scan_operations(&env.paths)
+                .operations
+                .is_empty());
+            assert_eq!(env.mapping_rows(), 0);
+        }
+        assert!(crate::modules::session_safety::require_verified_client().is_err());
+    }
+
+    #[test]
+    fn workbuddy_577_sync_rechecks_transfer_metadata_after_preview() {
+        for (source, assignment) in [
+            (false, "transport='cloud'"),
+            (true, "buddy_binding_json='{}'"),
+            (false, "group_id='fiction-group'"),
+        ] {
+            let env = workbuddy_577_env("577-sync-metadata-change");
+            let (group_id, token, target_id) = fast_forward_scene(&env);
+            let cid = if source { "sess-1" } else { &target_id };
+            let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+            conn.execute(
+                &format!("UPDATE sessions SET {assignment} WHERE id=?1"),
+                [cid],
             )
             .unwrap();
-        assert_eq!(
-            bindings,
-            (
-                "cloud".into(),
-                "fiction-cloud-group".into(),
-                "fiction-snapshot".into()
-            )
-        );
-        assert_eq!(
-            crate::modules::session_safety::require_verified_client().unwrap_err(),
-            crate::modules::session_safety::UNVERIFIED_CLIENT
-        );
-        // The native cloud partial indexes use -1, whereas retained owner queries require NULL.
+            drop(conn);
+            let db_before = std::fs::read(env.paths.workbuddy_db()).unwrap();
+            let target_before = body_bytes(&env, &target_id);
+            let baseline_before = env.baseline_files();
+            let report = sync(
+                &env,
+                "uid-b",
+                &[selection(&group_id, &token, SyncMode::FastForward)],
+            );
+            assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+            assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+            assert_eq!(body_bytes(&env, &target_id), target_before);
+            assert_eq!(std::fs::read(env.paths.workbuddy_db()).unwrap(), db_before);
+            assert_eq!(env.baseline_files(), baseline_before);
+            let check = preview(&env, "uid-b");
+            assert_eq!(check["groups"][0]["verdict"], "unknown", "{check}");
+            assert!(check["groups"][0]["availableModes"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn workbuddy_577_sync_recovery_does_not_rollback_cloud_sentinel_body() {
+        let env = workbuddy_577_env("577-recovery-cloud");
+        let (target_id, _, _) = interrupted_sync_scene(&env);
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
         conn.execute(
-            "UPDATE sessions SET deleted_at=-1 WHERE id='fiction-copy'",
-            [],
+            "UPDATE sessions SET transport='cloud',deleted_at=-1 WHERE id=?1",
+            [&target_id],
         )
         .unwrap();
-        assert_eq!(session_row_owner(&env.paths, "fiction-copy"), None);
+        drop(conn);
+        let body_before = body_bytes(&env, &target_id);
+        let db_before = std::fs::read(env.paths.workbuddy_db()).unwrap();
+        let report = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert!(!report.needs_recovery.is_empty());
+        assert_eq!(body_bytes(&env, &target_id), body_before);
+        assert_eq!(std::fs::read(env.paths.workbuddy_db()).unwrap(), db_before);
+        assert_eq!(
+            session_link::pending_operations(&env.paths, WbVariant::Cn).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn workbuddy_577_copy_recovery_rejects_changed_binding_before_replay() {
+        let env = workbuddy_577_env("577-copy-recovery-binding");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        let mut operation = session_link::scan_operations(&env.paths)
+            .operations
+            .remove(0);
+        operation.phase = OpPhase::BodyWritten;
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET buddy_binding_json='{}' WHERE id=?1",
+            [&target_id],
+        )
+        .unwrap();
+        drop(conn);
+        let body_before = body_bytes(&env, &target_id);
+        let db_before = std::fs::read(env.paths.workbuddy_db()).unwrap();
+        assert!(matches!(
+            recover_copy_operation(&env.paths, WbVariant::Cn, operation, None),
+            RecoverOutcome::NeedsRecovery {
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(body_bytes(&env, &target_id), body_before);
+        assert_eq!(std::fs::read(env.paths.workbuddy_db()).unwrap(), db_before);
     }
 
     fn copy(env: &Env, target_uid: &str, ids: &[&str]) -> Value {
@@ -6346,7 +6520,7 @@ mod tests {
     fn cross_copy_uses_target_columns_intersection() {
         let env = CrossEnv::new("columns");
         // 源多一列 transport；目标多一列 unread。
-        env.create_db(WbVariant::Cn, ", transport TEXT");
+        env.create_db(WbVariant::Cn, ", transport TEXT NOT NULL DEFAULT 'local'");
         env.create_edge_db(WbVariant::Cn);
         env.create_db(WbVariant::Ai, ", unread INTEGER");
         env.create_edge_db(WbVariant::Ai);
