@@ -4070,6 +4070,177 @@ mod tests {
         env
     }
 
+    /// Exact observed DDL, with only invented identities and invented JSONL records.
+    /// These checks never open an installed client's database or grant production access.
+    fn workbuddy_577_env(name: &str) -> Env {
+        let env = Env::new(name);
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch(include_str!(
+            "../../tests/fixtures/workbuddy-cn-5.7.7-structure.sql"
+        ))
+        .unwrap();
+        crate::modules::session_safety::validate_session_schema(&conn).unwrap();
+        let columns: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_xinfo('sessions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 40);
+        drop(conn);
+        let edge = Connection::open(env.paths.data_root.join("edge-sync-mapping-v4.db")).unwrap();
+        edge.execute_batch(include_str!(
+            "../../tests/fixtures/workbuddy-cn-5.7.7-edge-v4-structure.sql"
+        ))
+        .unwrap();
+        drop(edge);
+        env.set_login("uid-a");
+        env.add_session("sess-1", "uid-a", "标题一");
+        env.add_body("sess-1", &body_text("sess-1"));
+        env
+    }
+
+    #[test]
+    fn workbuddy_577_local_copy_preserves_source_and_keeps_mapping_empty() {
+        let env = workbuddy_577_env("577-local-copy");
+        let before = body_bytes(&env, "sess-1");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert_eq!(report["copied"].as_array().unwrap().len(), 1, "{report}");
+        let new_id = env.first_copy_id(&report);
+        assert_eq!(env.rows_for("uid-a"), vec!["sess-1"]);
+        assert_eq!(env.rows_for("uid-b"), vec![new_id.clone()]);
+        assert_eq!(body_bytes(&env, "sess-1"), before);
+        assert_eq!(env.mapping_rows(), 0);
+        let conn = open_db(&env.paths.workbuddy_db(), true).unwrap();
+        let transport: String = conn
+            .query_row(
+                "SELECT transport FROM sessions WHERE id=?1",
+                [&new_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(transport, "local");
+        session_backup::verify_database_integrity(&conn).unwrap();
+        assert!(crate::modules::session_safety::require_verified_client().is_err());
+    }
+
+    #[test]
+    fn workbuddy_577_fast_forward_updates_body_and_preserves_target_title() {
+        let env = workbuddy_577_env("577-sync");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        set_row_meta(&env, &target_id, "虚构目标标题", Some("虚构备注"));
+        let before = session_row(&env, &target_id);
+        let source_before = body_bytes(&env, "sess-1");
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        let after = session_row(&env, &target_id);
+        assert_eq!(
+            (&after.0, &after.1, &after.2),
+            (&before.0, &before.1, &before.2)
+        );
+        assert_eq!(body_bytes(&env, "sess-1"), source_before);
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            incoming_text(&env, "sess-1", &target_id)
+        );
+        assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+    }
+
+    #[test]
+    fn workbuddy_577_wal_snapshot_contains_uncheckpointed_fictional_row() {
+        let env = workbuddy_577_env("577-wal");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        conn.execute("INSERT INTO sessions(id,cwd,user_id,created_at,updated_at) VALUES('fiction-wal','/fiction','uid-c',1,2)", []).unwrap();
+        let wal = PathBuf::from(format!("{}-wal", env.paths.workbuddy_db().display()));
+        assert!(std::fs::metadata(wal).unwrap().len() > 0);
+        let snapshot = backup_workbuddy_db(&env.paths, &env.paths.backup_root()).unwrap();
+        let backup = open_db(&snapshot, true).unwrap();
+        let owner: String = backup
+            .query_row(
+                "SELECT user_id FROM sessions WHERE id='fiction-wal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "uid-c");
+        assert!(!snapshot.with_file_name("workbuddy.db-wal").exists());
+        session_backup::verify_database_integrity(&backup).unwrap();
+    }
+
+    #[test]
+    fn workbuddy_577_failed_copy_row_transaction_rolls_back() {
+        let env = workbuddy_577_env("577-rollback");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_fiction_copy AFTER INSERT ON sessions WHEN NEW.user_id='uid-b' BEGIN SELECT RAISE(ABORT,'fictional failure'); END;").unwrap();
+        let source_before = session_row(&env, "sess-1");
+        assert!(insert_session_copy(
+            &env.paths,
+            &env.paths,
+            "fiction-copy",
+            "sess-1",
+            "uid-a",
+            "uid-b"
+        )
+        .is_err());
+        assert!(env.rows_for("uid-b").is_empty());
+        assert_eq!(session_row(&env, "sess-1"), source_before);
+        session_backup::verify_database_integrity(&conn).unwrap();
+    }
+
+    // Characterization, NOT approval: the retained algorithm copies these bindings unchanged.
+    // Their official cross-account meaning is unknown; the production gate must stay closed.
+    #[test]
+    fn workbuddy_577_legacy_copy_preserves_unverified_cloud_and_snapshot_bindings() {
+        let env = workbuddy_577_env("577-cloud-characterization");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute("UPDATE sessions SET transport='cloud',group_id='fiction-cloud-group',buddy_snapshot_id='fiction-snapshot',buddy_binding_json='{}' WHERE id='sess-1'", []).unwrap();
+        assert_eq!(
+            insert_session_copy(
+                &env.paths,
+                &env.paths,
+                "fiction-copy",
+                "sess-1",
+                "uid-a",
+                "uid-b"
+            )
+            .unwrap(),
+            DbCopyOutcome::Inserted
+        );
+        let bindings: (String, String, String) = conn
+            .query_row(
+                "SELECT transport,group_id,buddy_snapshot_id FROM sessions WHERE id='fiction-copy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            bindings,
+            (
+                "cloud".into(),
+                "fiction-cloud-group".into(),
+                "fiction-snapshot".into()
+            )
+        );
+        assert_eq!(
+            crate::modules::session_safety::require_verified_client().unwrap_err(),
+            crate::modules::session_safety::UNVERIFIED_CLIENT
+        );
+        // The native cloud partial indexes use -1, whereas retained owner queries require NULL.
+        conn.execute(
+            "UPDATE sessions SET deleted_at=-1 WHERE id='fiction-copy'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(session_row_owner(&env.paths, "fiction-copy"), None);
+    }
+
     fn copy(env: &Env, target_uid: &str, ids: &[&str]) -> Value {
         let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
         copy_sessions_for_switch_at(
