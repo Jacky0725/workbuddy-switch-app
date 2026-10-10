@@ -38,7 +38,9 @@ pub fn enabled(app: &AppHandle) -> bool {
     }
     #[cfg(desktop)]
     {
-        !crate::is_screenshot_demo() && agent_studio_desktop::is_enabled(app)
+        wb_switch_core::modules::manager_security::OPTIONAL_COMPANION_ENABLED
+            && !crate::is_screenshot_demo()
+            && agent_studio_desktop::is_enabled(app)
     }
 }
 
@@ -56,6 +58,9 @@ pub async fn set_companion_enabled(app: AppHandle, enabled: bool) -> Result<bool
     }
     #[cfg(desktop)]
     {
+        if !wb_switch_core::modules::manager_security::OPTIONAL_COMPANION_ENABLED {
+            return Err("本版本未开放可选悬浮窗".into());
+        }
         if crate::is_screenshot_demo() {
             return Err("演示模式不启用悬浮窗".into());
         }

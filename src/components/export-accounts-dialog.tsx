@@ -102,15 +102,8 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported 
         onExported?.(res.accounts.length);
         onOpenChange(false);
       } else {
-        // 桌面端：系统保存对话框选位置 → 后端写入该路径（WKWebView 不支持 `<a download>`）
-        const { save } = await import("@tauri-apps/plugin-dialog");
-        const path = await save({
-          title: "导出账号",
-          defaultPath: exportFileName(),
-          filters: [{ name: "JSON", extensions: ["json"] }],
-        });
-        if (!path) return; // 用户取消保存对话框
-        const res = await api.exportAccountsToPath(ids, path);
+        const res = await api.exportAccountsToPath(ids);
+        if (res.cancelled || !res.path) return;
         setSavedPath(res.path);
         onExported?.(ids.length);
       }

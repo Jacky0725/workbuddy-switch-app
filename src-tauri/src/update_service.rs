@@ -316,6 +316,9 @@ pub async fn check<R: Runtime>(app: &AppHandle<R>, proxy: Option<&str>, force: b
 /// 下载在后台任务里进行（含重新 check 一次以拿到 `Update` 句柄），因此托盘与前端
 /// 都不需要等网络；重复调用由 `BUSY` 拒绝。
 pub fn start_download<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if !wb_switch_core::modules::manager_security::UPDATES_ENABLED {
+        return Err("WorkBuddy Manager 更新源尚未配置，下载和安装已关闭".into());
+    }
     if crate::is_screenshot_demo() {
         return Err(DEMO_DOWNLOAD_MESSAGE.to_string());
     }
@@ -365,6 +368,9 @@ pub fn start_download<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
 ///
 /// 无包时返回可读错误（不 panic）；安装失败置 Error + 通知，并释放已暂存的包。
 pub async fn restart<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if !wb_switch_core::modules::manager_security::UPDATES_ENABLED {
+        return Err("WorkBuddy Manager 更新源尚未配置，下载和安装已关闭".into());
+    }
     if crate::is_screenshot_demo() {
         return Err(DEMO_RESTART_MESSAGE.to_string());
     }

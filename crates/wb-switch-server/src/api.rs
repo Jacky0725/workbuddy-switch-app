@@ -226,6 +226,13 @@ pub fn router() -> Router {
             "/api/update/config",
             get(api_update_config).post(api_save_update_config),
         )
+        .route(
+            "/api/manager/backups",
+            get(manager_list_backups).post(manager_create_backup),
+        )
+        .route("/api/manager/backups/preview", post(manager_preview_backup))
+        .route("/api/manager/backups/restore", post(manager_restore_backup))
+        .route("/api/manager/logs", get(manager_logs))
         .fallback(static_handler)
 }
 
@@ -721,25 +728,11 @@ async fn api_export_accounts(Json(body): Json<Value>) -> Response {
     }
 }
 
-async fn api_export_accounts_to_path(Json(body): Json<Value>) -> Response {
-    let ids: Vec<String> = body
-        .get("accountIds")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let path = body
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    match export_import::export_accounts_to_path(&ids, &path) {
-        Ok(path) => json_ok(json!({ "ok": true, "path": path })),
-        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
-    }
+async fn api_export_accounts_to_path() -> Response {
+    json_err(
+        "浏览器不接受本地导出路径，请使用账号资料下载".into(),
+        StatusCode::FORBIDDEN,
+    )
 }
 
 async fn api_preview_import(Json(body): Json<Value>) -> Response {
@@ -2044,5 +2037,52 @@ mod tests {
 
         assert_eq!(item["variant"], "ai");
         assert_eq!(item["statusUnsupported"], true);
+    }
+}
+
+async fn manager_list_backups() -> Response {
+    match wb_switch_core::modules::manager_backup::list_at(&config::store_dir()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+async fn manager_create_backup() -> Response {
+    match wb_switch_core::modules::manager_backup::create_at(&config::store_dir()) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagerBackupId {
+    id: String,
+}
+async fn manager_preview_backup(Json(body): Json<ManagerBackupId>) -> Response {
+    match wb_switch_core::modules::manager_backup::preview_at(&config::store_dir(), &body.id) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagerRestoreBody {
+    request: wb_switch_core::modules::manager_backup::RestoreRequest,
+}
+async fn manager_restore_backup(Json(body): Json<ManagerRestoreBody>) -> Response {
+    match wb_switch_core::modules::manager_backup::restore_at(&config::store_dir(), body.request) {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+async fn manager_logs() -> Response {
+    let root = config::store_dir();
+    let tasks =
+        match wb_switch_core::modules::manager_scheduler::snapshot_at(&root, config::now_ms()) {
+            Ok(value) => value.tasks,
+            Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+        };
+    match notifications::list_at(&root) {
+        Ok(items) => json_ok(json!({"tasks":tasks,"notifications":items})),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }

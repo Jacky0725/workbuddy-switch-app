@@ -923,6 +923,8 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));
     case "get_credit_statistics": return buildStatistics();
     case "get_token_statistics": return demoTokenStatistics(typeof args?.days === "number" ? args.days : undefined);
+    case "list_manager_backups": return [];
+    case "get_manager_logs": return { tasks: managerDemoSnapshot(demoAccounts).tasks, notifications: [] };
     case "get_manager_scheduler": return managerDemoSnapshot(demoAccounts);
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };

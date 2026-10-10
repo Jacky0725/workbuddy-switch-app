@@ -8,12 +8,11 @@
 //! ```
 
 mod api;
+mod security;
 
 use serde_json::json;
 
-use wb_switch_core::modules::{
-    account, auth_file, config, process, rotate, travel, update, variant::WbVariant,
-};
+use wb_switch_core::modules::{account, auth_file, process, update, variant::WbVariant};
 
 fn default_port() -> u16 {
     57890
@@ -22,57 +21,8 @@ fn default_port() -> u16 {
 /// 每日签到由统一服务轮询配置，授权未验证时仅记录后台心跳。
 /// 其他上游后台任务保留原行为，真实运行仍需单独验收。
 fn spawn_background_loops() {
+    // Startup must not change official client hooks or credentials.
     tokio::spawn(wb_switch_core::modules::manager_scheduler::background_loop());
-
-    tokio::spawn(async move {
-        let mut last_cycle_at: i64 = 0;
-        loop {
-            let cfg = config::load_auto_rotate_config();
-            if cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
-                let interval_minutes = cfg
-                    .get("check_interval_minutes")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .max(1);
-                let now = config::now_ms();
-                if now - last_cycle_at >= interval_minutes * 60_000 {
-                    last_cycle_at = now;
-                    let _ = rotate::run_rotate_cycle().await;
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        }
-    });
-
-    // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
-    tokio::spawn(async move {
-        let _ = travel::run_travel_cycle().await;
-        loop {
-            tokio::time::sleep(travel::TRAVEL_RETRY_INTERVAL).await;
-            let _ = travel::run_travel_cycle().await;
-        }
-    });
-
-    // 旅行领取：启动立刻查一轮（避免重启后空等 15 分钟漏领），之后按周期检查。
-    tokio::spawn(async move {
-        let _ = travel::run_travel_claim_cycle().await;
-        loop {
-            tokio::time::sleep(travel::TRAVEL_CLAIM_INTERVAL).await;
-            let _ = travel::run_travel_claim_cycle().await;
-        }
-    });
-
-    // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`，入账后由前端下次拉取可见。
-    // webui 没有 Tauri 事件通道，因此不需要推送回调（桌面端见 src-tauri/src/lib.rs）。
-    wb_switch_core::modules::rate_limit_events::spawn_watcher(|| {});
-
-    // 默认接入：后台线程自动安装 hook（幂等、非阻塞、失败静默）；
-    // 装上了就作废扫描缓存——扫描范围从全量收窄到「未注册的来源」。
-    std::thread::spawn(|| {
-        if wb_switch_core::modules::rate_limit_hook::auto_install_on_startup() {
-            wb_switch_core::modules::limits::invalidate_scan_cache();
-        }
-    });
 }
 
 /// CLI 档位参数：`--variant ai` / `--variant=ai`；缺省国内版。
@@ -137,7 +87,7 @@ async fn serve(args: &[String]) {
         }
     }
 
-    let app = api::router();
+    let app = security::wrap(api::router(), port);
     let addr = format!("127.0.0.1:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,

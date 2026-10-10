@@ -67,7 +67,7 @@ pub fn home_dir() -> PathBuf {
 }
 
 pub fn store_dir() -> PathBuf {
-    home_dir().join(".wb-switch")
+    home_dir().join(".workbuddy-manager")
 }
 
 pub fn accounts_file() -> PathBuf {

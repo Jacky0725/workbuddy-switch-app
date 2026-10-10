@@ -86,7 +86,7 @@ export default function AutoCheckinPage() {
             <div className="space-y-2"><Label htmlFor="daily-retry">重试间隔（秒）</Label><Input id="daily-retry" type="number" min={30} max={86400} value={draft.retry_delay_seconds} disabled={readonly || !!error} onChange={e => edit({ ...draft, retry_delay_seconds: Number(e.target.value) })} /></div></div>
           <div className="flex items-center justify-between gap-4"><div><Label htmlFor="daily-catchup">允许当日补执行</Label><p className="mt-1 text-xs text-muted-foreground">重新打开应用或唤醒后处理当天错过的计划；不补签昨天</p></div><Switch id="daily-catchup" checked={draft.catch_up} disabled={readonly || !!error} onCheckedChange={catch_up => edit({ ...draft, catch_up })} /></div>
           <p className="text-sm text-muted-foreground">下次预计执行：{nextPlanLabel(snapshot)}</p>
-          <p className="text-xs text-muted-foreground">成功后当天不再重复提交；提交结果未确认时仅核实状态。Windows 登录自启动尚未接入。</p>
+          <p className="text-xs text-muted-foreground">成功后当天不再重复提交；提交结果未确认时仅核实状态。Windows 登录自启动可在设置页开启；关闭窗口后需保留托盘进程。</p>
           {issue && <p role="alert" className="text-sm text-destructive">{issue}</p>}
           <div className="flex flex-wrap items-center gap-3"><Button disabled={!dirty || readonly || !!error || !!issue} onClick={() => void save()}><Save />{saving ? "正在保存…" : "保存计划"}</Button><span className="text-xs text-muted-foreground">{dirty ? "有未保存修改" : "设置与已保存配置一致"}</span><Button variant="outline" disabled={!snapshot.production_enabled || saving || !!error} title={snapshot.blocked_reason} onClick={() => void run()}><CircleCheck />全部立即签到</Button></div>
         </CardContent></Card>

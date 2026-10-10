@@ -1,3 +1,4 @@
+import type { ManagerBackupInfo, ManagerRestorePreview, ManagerRestoreReport, ManagerLogs } from "./types";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountMeta,
@@ -62,10 +63,18 @@ import { screenshotDemoResponse } from "./screenshot-demo";
  * - 桌面 App（Tauri）：`invoke` 调用 Rust commands
  * - webui（浏览器）：HTTP fetch 调用本地 workbuddy-switch 服务（127.0.0.1）
  */
-const API_BASE = "http://127.0.0.1:57890";
+const API_BASE = typeof window !== "undefined" && /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(window.location.origin)
+  ? window.location.origin : "http://127.0.0.1:57890";
+let sessionReady: Promise<void> | null = null;
+async function ensureLocalSession(): Promise<void> {
+  sessionReady ??= fetch(`${API_BASE}/api/session`, { credentials: "same-origin", cache: "no-store" }).then(res => {
+    if (!res.ok) throw new Error("本机会话无法建立");
+  }).catch(error => { sessionReady = null; throw error; });
+  await sessionReady;
+}
 
 const DEMO_READ_COMMANDS = new Set([
-  "get_manager_scheduler",
+  "get_manager_scheduler", "list_manager_backups", "get_manager_logs",
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "get_jetbrains_status", "list_vscode_sessions", "list_codebuddy_ide_sessions", "list_codebuddy_intl_ide_sessions", "vscode_session_links_preview", "codebuddy_ide_session_links_preview", "codebuddy_intl_ide_session_links_preview", "list_account_sessions", "session_links_preview_cross", "list_session_groups", "get_session_group", "preview_session_group_pair", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
@@ -108,6 +117,11 @@ type Route = { method: "GET" | "POST"; path: string };
 
 /** Tauri command → HTTP 路由映射（webui 模式）。 */
 const ROUTES: Record<string, Route> = {
+  list_manager_backups: { method: "GET", path: "/api/manager/backups" },
+  create_manager_backup: { method: "POST", path: "/api/manager/backups" },
+  preview_manager_restore: { method: "POST", path: "/api/manager/backups/preview" },
+  restore_manager_backup: { method: "POST", path: "/api/manager/backups/restore" },
+  get_manager_logs: { method: "GET", path: "/api/manager/logs" },
   get_manager_scheduler: { method: "GET", path: "/api/manager/scheduler" },
   save_manager_scheduler: { method: "POST", path: "/api/manager/scheduler" },
   run_manager_checkin: { method: "POST", path: "/api/manager/checkin" },
@@ -229,11 +243,15 @@ async function httpCall<T>(cmd: string, args?: Record<string, unknown>): Promise
       route.method === "GET"
         ? `${API_BASE}${route.path}${queryString(args)}`
         : `${API_BASE}${route.path}`;
-    res = await fetch(url, {
+    await ensureLocalSession();
+    const options: RequestInit = {
       method: route.method,
       headers: { "Content-Type": "application/json" },
       body: route.method === "POST" ? JSON.stringify(args ?? {}) : undefined,
-    });
+      credentials: "same-origin", cache: "no-store",
+    };
+    res = await fetch(url, options);
+    if (res.status === 401) { sessionReady = null; await ensureLocalSession(); res = await fetch(url, options); }
   } catch {
     throw new Error(`无法连接 workbuddy-switch 服务（${API_BASE}），请先运行 \`workbuddy-switch\``);
   }
@@ -521,12 +539,11 @@ export function exportAccounts(accountIds: string[]): Promise<{ ok: boolean; acc
   return call("export_accounts", { accountIds });
 }
 
-/** 桌面端：把完整记录写入用户选择的路径（系统保存对话框产物）。 */
+/** Desktop: Rust opens a native save dialog; browser parameters cannot select paths. */
 export function exportAccountsToPath(
   accountIds: string[],
-  path: string,
-): Promise<{ ok: boolean; path: string }> {
-  return call("export_accounts_to_path", { accountIds, path });
+): Promise<{ ok: boolean; path?: string; cancelled?: boolean }> {
+  return call("export_accounts_to_path", { accountIds });
 }
 
 export function previewImportAccounts(
@@ -1134,3 +1151,9 @@ export function revealErrorLog(): Promise<void> {
   if (demoModeEnabled || isWebui()) return Promise.resolve();
   return call<unknown>("reveal_error_log").then(() => undefined);
 }
+
+export function listManagerBackups(): Promise<ManagerBackupInfo[]> { return call("list_manager_backups"); }
+export function createManagerBackup(): Promise<ManagerBackupInfo> { return call("create_manager_backup"); }
+export function previewManagerRestore(id: string): Promise<ManagerRestorePreview> { return call("preview_manager_restore", { id }); }
+export function restoreManagerBackup(preview: ManagerRestorePreview): Promise<ManagerRestoreReport> { return call("restore_manager_backup", { request: { id: preview.id, expected_revision: preview.current_revision, confirmed: true } }); }
+export function getManagerLogs(): Promise<ManagerLogs> { return call("get_manager_logs"); }

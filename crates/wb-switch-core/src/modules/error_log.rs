@@ -53,8 +53,8 @@ fn build_entry(kind: &str, message: &str, detail: &str, at_ms: i64) -> Value {
     json!({
         "ts": at_ms,
         "kind": normalize_kind(kind),
-        "message": message,
-        "detail": truncate_detail(detail),
+        "message": crate::modules::manager_security::redact(message),
+        "detail": truncate_detail(&crate::modules::manager_security::redact(detail)),
         "appVersion": crate::modules::update::APP_VERSION,
         "os": std::env::consts::OS,
     })

@@ -1,3 +1,4 @@
+import { redact } from "./redact";
 import { toast } from "sonner";
 
 import * as api from "./api";
@@ -80,9 +81,9 @@ export function reportError(
   message: string,
   options: { detail?: string; source?: string } = {},
 ): void {
-  const text = message.trim() || "未知错误";
+  const text = redact(message.trim() || "未知错误");
   const source = options.source?.trim() || "unknown";
-  const detail = options.detail ?? "";
+  const detail = redact(options.detail ?? "");
   const now = Date.now();
   if (!shouldReport(`${kind}|${source}|${text}`, now)) return;
 

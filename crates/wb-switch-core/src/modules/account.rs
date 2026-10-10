@@ -576,7 +576,17 @@ pub fn build_auth_headers(account: &Value) -> HashMap<String, String> {
 
 /// 删除账号（按 id）。
 pub fn delete_account(account_id: &str) -> Result<(), String> {
-    delete_account_from_path(&accounts_file(), account_id)
+    let result = delete_account_from_path(&accounts_file(), account_id);
+    let _ = crate::modules::notifications::record(
+        if result.is_ok() { "success" } else { "error" },
+        if result.is_ok() {
+            "账号已删除"
+        } else {
+            "账号删除未完成"
+        },
+        None,
+    );
+    result
 }
 
 /// 导入本机当前账号（从该档位的登录态文件读取）。

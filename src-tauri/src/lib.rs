@@ -7,7 +7,6 @@ mod instance_lock;
 mod tray;
 mod update_service;
 
-use std::time::Duration;
 use tauri::Emitter;
 use wb_switch_core::modules;
 
@@ -54,84 +53,10 @@ pub(crate) fn notify_codebuddy_cli_updated(app: &tauri::AppHandle) {
 }
 
 /// 每日签到由统一服务轮询配置，授权未验证时仅记录后台心跳。
-/// 其他上游后台任务保留原行为，真实运行仍需单独验收。
-fn spawn_background_loops(app: tauri::AppHandle) {
-    let rotate_app = app.clone();
+/// 未验证的上游后台网络与自动安装任务不在启动时运行。
+fn spawn_background_loops(_app: tauri::AppHandle) {
+    // No automatic travel, rotation, refresh, hook installation or updater requests.
     tauri::async_runtime::spawn(modules::manager_scheduler::background_loop());
-
-    // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
-    // 档位过滤在 core（`travel_capable_accounts`）：不支持成长中心的档位不会发请求。
-    tauri::async_runtime::spawn(async move {
-        let _ = modules::travel::run_travel_cycle().await;
-        loop {
-            tokio::time::sleep(modules::travel::TRAVEL_RETRY_INTERVAL).await;
-            let _ = modules::travel::run_travel_cycle().await;
-        }
-    });
-
-    // 旅行领取：启动立刻查一轮（避免重启后空等 15 分钟漏领），之后按周期检查。
-    tauri::async_runtime::spawn(async move {
-        let _ = modules::travel::run_travel_claim_cycle().await;
-        loop {
-            tokio::time::sleep(modules::travel::TRAVEL_CLAIM_INTERVAL).await;
-            let _ = modules::travel::run_travel_claim_cycle().await;
-        }
-    });
-
-    tauri::async_runtime::spawn(async move {
-        let mut last_keepalive_day = String::new();
-        let mut last_rotate_at: i64 = 0;
-        loop {
-            // 自动轮换（CodeBuddy CLI）：按配置间隔执行
-            let rotate_cfg = modules::config::load_auto_rotate_config();
-            if rotate_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(true) {
-                let interval_minutes = rotate_cfg
-                    .get("check_interval_minutes")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(5)
-                    .max(1);
-                let now = modules::config::now_ms();
-                if now - last_rotate_at >= interval_minutes * 60_000 {
-                    last_rotate_at = now;
-                    let result = modules::rotate::run_rotate_cycle().await;
-                    deliver_rotate_notify(&rotate_app, &result);
-                }
-            }
-            let today = modules::checkin::date_str(None);
-            if today != last_keepalive_day {
-                last_keepalive_day = today;
-                // 保活会批量改写 `access_token` 并同步回 settings.json，期间前端若拉到
-                // 状态会读到「账号库已换新、settings 未跟上」的中间态。刷新前后各广播
-                // 一次：先让前端把已显示的旧判断标记为「同步中」，刷新完再让它重读，
-                // 避免误判的告警滞留在页面上。
-                notify_codebuddy_cli_updated(&rotate_app);
-                let _ = modules::refresh::run_keepalive_cycle().await;
-                notify_codebuddy_cli_updated(&rotate_app);
-            }
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
-    });
-
-    // 统一更新服务：首次 15 秒后检查一次，之后每 30 分钟（未带 force，走 core 的
-    // 6 小时缓存）。检查由 Rust 常驻，替代前端 30 分钟轮询：轻量模式 / 主窗口关闭时
-    // 同样在跑，托盘菜单随时反映最新阶段。
-    update_service::spawn_periodic_check(app.clone());
-
-    // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`（CLI / WorkBuddy 的 429 当轮
-    // 由客户端 hook 追加），入账后通知前端立即拉取。轻量模式下窗口销毁但进程仍在，
-    // 状态由后端持有（见 `rate_limit_events.rs`）。
-    modules::rate_limit_events::spawn_watcher(move || {
-        let _ = app.emit("rate-limits-updated", serde_json::json!({}));
-    });
-
-    // 默认接入：后台线程自动安装 hook（幂等、非阻塞、失败静默）。
-    // 前置条件（开关开启 / 用户没卸载过 / 存在客户端 / 未装全）由 core 判定；
-    // 装上了就作废扫描缓存——扫描范围从全量收窄到「未注册的来源」。
-    std::thread::spawn(|| {
-        if modules::rate_limit_hook::auto_install_on_startup() {
-            modules::limits::invalidate_scan_cache();
-        }
-    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -150,12 +75,13 @@ pub fn run() {
 
     builder = builder
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init());
 
     #[cfg(desktop)]
-    if !is_screenshot_demo() {
+    if wb_switch_core::modules::manager_security::OPTIONAL_COMPANION_ENABLED
+        && !is_screenshot_demo()
+    {
         builder = builder.plugin(agent_studio_desktop::init(companion::config()));
     }
 
@@ -261,6 +187,11 @@ pub fn run() {
             commands::checkin_all,
             commands::get_auto_checkin_config,
             commands::get_manager_scheduler,
+            commands::list_manager_backups,
+            commands::create_manager_backup,
+            commands::preview_manager_restore,
+            commands::restore_manager_backup,
+            commands::get_manager_logs,
             commands::save_manager_scheduler,
             commands::run_manager_checkin,
             commands::save_auto_checkin_config,

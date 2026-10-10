@@ -1051,3 +1051,8 @@ export interface VscodeSessionList {
    */
   dataRoot?: string | null;
 }
+
+export interface ManagerBackupInfo { id: string; created_at_ms: number | null; account_count: number | null; error: string | null }
+export interface ManagerRestorePreview { id: string; account_count: number; current_revision: string; scope: string }
+export interface ManagerRestoreReport { restored_accounts: number; rollback_id: string }
+export interface ManagerLogs { tasks: ManagerDailyTask[]; notifications: AppNotification[] }

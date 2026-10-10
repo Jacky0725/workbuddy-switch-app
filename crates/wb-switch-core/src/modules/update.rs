@@ -229,6 +229,10 @@ async fn fetch_latest_tag(
 /// `force=true` 绕过缓存强制刷新（设置页手动检查）；否则 6 小时内成功结果直接返回，
 /// 不发网络请求。主端点 manifest 失败时自动走 302 兜底；两个端点都失败返回可读错误。
 pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
+    if !crate::modules::manager_security::UPDATES_ENABLED {
+        return json!({"ok":false,"error":"WorkBuddy Manager 尚无已验证的更新源，请使用本地安装包升级","current":APP_VERSION});
+    }
+
     if !force {
         if let Some(cached) = CACHE.lock().unwrap().as_ref() {
             if now_secs() - cached.checked_at < CACHE_TTL_SECS {

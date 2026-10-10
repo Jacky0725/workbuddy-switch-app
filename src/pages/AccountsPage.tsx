@@ -583,7 +583,7 @@ export default function AccountsPage() {
 
   /** 导出完成提示（含安全提醒）。 */
   function onExported(count: number) {
-    const text = `已导出 ${count} 个账号。文件含登录 token，等同密码，请勿上传网盘或发送给他人。`;
+    const text = `已导出 ${count} 个账号资料，不含登录凭证。恢复登录请使用加密备份或重新授权。`;
     toast.success("导出成功", { description: text });
   }
 
@@ -961,12 +961,12 @@ export default function AccountsPage() {
           </div>
           <div className="flex items-center gap-1">
             <DemoAction>
-              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setImportOpen(true)} title="从备份文件导入账号">
+              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setImportOpen(true)} title="从兼容 JSON 文件预览并导入账号">
                 <FileUp />导入备份
               </Button>
             </DemoAction>
             <DemoAction>
-              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={visibleAccounts.length === 0} title="导出账号备份">
+              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={visibleAccounts.length === 0} title="导出账号公开资料，不含登录凭证">
                 <FileDown />导出
               </Button>
             </DemoAction>
@@ -1001,7 +1001,7 @@ export default function AccountsPage() {
                       ? "保活刷新已更新账号 Token，正在同步到 CodeBuddy CLI 认证配置。稍候会自动完成，无需操作。"
                       : codebuddyCli.migrationRequired
                         ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
-                        : "Windows 使用 CodeBuddy settings.json 中的认证 Token。保活刷新只更新后续启动使用的 Token；切换账号会先关闭正在运行的 CodeBuddy CLI，重新打开 CLI 后即用新账号。"
+                        : "本版本不会在后台自动刷新登录凭证。手动切换 CodeBuddy CLI 账号会先关闭正在运行的 CLI，需重新打开后使用。"
                 : codebuddyCli.migrationRequired
                   ? "检测到旧版 helper，请先升级；升级前不会将 CLI 切换显示为已验证。"
                   : codebuddyCli.configured

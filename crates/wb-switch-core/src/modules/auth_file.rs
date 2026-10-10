@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
 use crate::modules::account::{get_str, secret_value};
-use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
+use crate::modules::config::{atomic_write, now_ms};
 use crate::modules::variant::WbVariant;
 
 /// WorkBuddy 官方认证文件路径（按档位，与 cockpit 一致）。
@@ -50,17 +50,20 @@ pub fn read_auth_file_at(path: &Path) -> Option<Value> {
 }
 
 /// 切换前备份当前认证文件，返回备份路径。对照 server.py `backup_auth_file`。
-pub fn backup_auth_file(variant: WbVariant) -> Option<PathBuf> {
+pub fn backup_auth_file(variant: WbVariant) -> Result<Option<PathBuf>, String> {
     let path = auth_file_path(variant);
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
-    let dir = backup_dir();
-    std::fs::create_dir_all(&dir).ok()?;
-    let ts = utc_iso();
-    let dest = dir.join(variant.backup_file_name(&ts));
-    std::fs::copy(&path, &dest).ok()?;
-    Some(dest)
+    let mut bytes = std::fs::read(&path).map_err(|_| "备份失败，本次操作已取消".to_string())?;
+    let result = crate::modules::credential_store::backup_legacy(
+        &crate::modules::config::store_dir(),
+        &bytes,
+    );
+    bytes.fill(0);
+    result
+        .map(Some)
+        .map_err(|_| "备份失败，本次操作已取消".to_string())
 }
 
 /// 从账号库记录构造官方 account 字段。对照 server.py `build_account_obj`。
@@ -177,6 +180,19 @@ pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(),
 }
 
 fn write_account_to_auth_file_at(acc: &Value, path: &Path) -> Result<(), String> {
+    use fs2::FileExt;
+    let parent = path.parent().ok_or("认证文件目录无效")?;
+    std::fs::create_dir_all(parent).map_err(|_| "认证文件目录不可写")?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join("workbuddy-manager-auth.lock"))
+        .map_err(|_| "认证文件锁不可用")?;
+    lock.try_lock_exclusive()
+        .map_err(|_| "认证文件正由另一任务更新，本次操作已取消")?;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -456,6 +472,28 @@ mod tests {
         let written = read_auth_file_at(&path).unwrap();
         assert_eq!(written["auth"]["accessToken"], "test-access-token");
         assert_eq!(written["allAccounts"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn concurrent_auth_writer_is_rejected_without_modifying_authentication() {
+        use fs2::FileExt;
+        let dir = TempAuthDir::new();
+        let path = dir.auth_path(WbVariant::Cn);
+        std::fs::write(&path, r#"{"account":{"uid":"original"}}"#).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.parent().unwrap().join("workbuddy-manager-auth.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        assert!(write_account_to_auth_file_at(
+            &json!({"uid":"target", "access_token":"fiction"}),
+            &path
+        )
+        .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[test]

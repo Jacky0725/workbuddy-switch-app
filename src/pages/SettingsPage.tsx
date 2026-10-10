@@ -891,7 +891,7 @@ function UpdateCard() {
 
         <div className="flex min-w-0 items-center justify-between gap-3 border-b border-border/60 bg-muted/25 px-4 py-3 text-sm sm:px-5">
           <div className="min-w-0 flex-1">
-            <div className="font-medium">公开更新源</div>
+            <div className="font-medium">上游源码参考（本产品自动更新已关闭）</div>
             <div className="truncate text-xs text-muted-foreground">{GITHUB_REPOSITORY_URL}</div>
           </div>
           <DemoAction><Button
@@ -905,7 +905,7 @@ function UpdateCard() {
         </div>
 
         <SettingsFieldRow
-          label="更新代理地址"
+          label="上游更新代理（本产品不使用）"
           description="仅用于 GitHub 更新检查和安装包下载；留空表示关闭显式代理。"
           htmlFor="update-proxy"
           className="bg-muted/25"
@@ -1618,7 +1618,7 @@ export default function SettingsPage() {
         <AutoCheckinCard />
         <AutoRotateCard />
         <RateLimitCard />
-        {api.isDesktop() && !api.isDemoMode() ? <CompanionCard /> : null}
+        {false ? <CompanionCard /> : null}
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         <NotificationHistoryCard />
         <ErrorLogCard />

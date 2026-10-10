@@ -1,6 +1,6 @@
 [package]
 name = "wb-switch-core"
-version = "0.1.58"
+version = "0.2.0-alpha.1"
 edition = "2021"
 description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
@@ -19,6 +19,7 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 sha2 = "0.10"
 # Existing locked dependency; serialize account-index updates across hosts.
 fs2 = "0.4"
+regex = "1"
 
 # CodeBuddy CN IDE Safe Storage (state.vscdb secret inject)
 aes = "0.8"

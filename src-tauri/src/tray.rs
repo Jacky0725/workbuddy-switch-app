@@ -653,8 +653,9 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>>
         LIGHTWEIGHT_MODE.load(Ordering::Acquire),
         None::<&str>,
     )?;
-    let companion_enabled =
-        !crate::is_screenshot_demo() && agent_studio_desktop::is_enabled(app.app_handle());
+    let companion_enabled = wb_switch_core::modules::manager_security::OPTIONAL_COMPANION_ENABLED
+        && !crate::is_screenshot_demo()
+        && agent_studio_desktop::is_enabled(app.app_handle());
     let companion_toggle = MenuItem::with_id(
         app,
         "companion-toggle",

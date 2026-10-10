@@ -146,6 +146,34 @@ pub fn switch_account(
     copy_session_ids: &[String],
     sync_selections: &[SyncSelection],
 ) -> Result<Value, String> {
+    let _ = crate::modules::notifications::record("info", "开始账号切换", None);
+    let result = switch_account_inner(
+        progress_fn,
+        account_id,
+        restart,
+        share_sessions,
+        copy_session_ids,
+        sync_selections,
+    );
+    let _ = crate::modules::notifications::record(
+        if result.is_ok() { "success" } else { "error" },
+        if result.is_ok() {
+            "账号切换流程完成"
+        } else {
+            "账号切换未完成"
+        },
+        result.as_ref().err().map(String::as_str),
+    );
+    result
+}
+fn switch_account_inner(
+    progress_fn: Option<&ProgressFn>,
+    account_id: &str,
+    restart: bool,
+    share_sessions: bool,
+    copy_session_ids: &[String],
+    sync_selections: &[SyncSelection],
+) -> Result<Value, String> {
     let progress = |message: &str| {
         eprintln!("[switch] progress: {message}");
         if let Some(p) = progress_fn {
@@ -166,7 +194,7 @@ pub fn switch_account(
         variant,
         !copy_session_ids.is_empty() || !sync_selections.is_empty(),
     )?;
-    let backup = auth_file::backup_auth_file(variant);
+    let backup = auth_file::backup_auth_file(variant)?;
 
     let mut copy_report: Option<Value> = None;
     let mut session_report: Option<Value> = None;

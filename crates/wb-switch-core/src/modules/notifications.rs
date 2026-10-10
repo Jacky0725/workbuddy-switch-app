@@ -104,11 +104,19 @@ pub fn record_at(
     let mut store = load_at(root)?;
     let entry = NotificationEntry {
         level: level.to_string(),
-        title: trim_text(title, TITLE_LIMIT),
+        title: trim_text(
+            &crate::modules::manager_security::redact(title),
+            TITLE_LIMIT,
+        ),
         description: description
             .map(str::trim)
             .filter(|text| !text.is_empty())
-            .map(|text| trim_text(text, DESCRIPTION_LIMIT)),
+            .map(|text| {
+                trim_text(
+                    &crate::modules::manager_security::redact(text),
+                    DESCRIPTION_LIMIT,
+                )
+            }),
         at: now_ms(),
     };
     let duplicate = store.items.last().is_some_and(|last| {

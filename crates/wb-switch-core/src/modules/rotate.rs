@@ -139,6 +139,31 @@ pub fn decide_target(
     has_live_session: bool,
     min_remaining: f64,
 ) -> Decision {
+    decide_target_at(
+        candidates,
+        current_account_id,
+        last_switch_at_ms,
+        cooldown_ms,
+        min_gap_ms,
+        min_urgency_ms,
+        has_live_session,
+        min_remaining,
+        now_ms(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_target_at(
+    candidates: &[Candidate],
+    current_account_id: Option<&str>,
+    last_switch_at_ms: Option<i64>,
+    cooldown_ms: i64,
+    min_gap_ms: i64,
+    min_urgency_ms: i64,
+    has_live_session: bool,
+    min_remaining: f64,
+    now: i64,
+) -> Decision {
     // 1) 有效候选（可被选为目标）
     let mut valid: Vec<&Candidate> = candidates.iter().filter(|c| c.valid).collect();
     if valid.is_empty() {
@@ -149,7 +174,7 @@ pub fn decide_target(
     let target = valid[0];
     // 3) 紧迫度检查：目标到期还早（> 阈值）→ 无需切换
     if let Some(target_ts) = target.soonest_expire_at {
-        let remaining_ms = target_ts - now_ms();
+        let remaining_ms = target_ts - now;
         if remaining_ms > min_urgency_ms {
             return Decision::Skip(format!(
                 "所有账号到期都还早（最紧迫的还剩 {} 天），无需切换",
@@ -163,7 +188,7 @@ pub fn decide_target(
     }
     // 5) 冷却期
     if let Some(ts) = last_switch_at_ms {
-        if ts + cooldown_ms > now_ms() {
+        if ts + cooldown_ms > now {
             return Decision::Skip("处于切换冷却期".to_string());
         }
     }
@@ -592,7 +617,7 @@ mod tests {
             cand("b", Some(now + 5 * 24 * 3_600_000), 50.0, true),
         ];
         assert_eq!(
-            dt(&candidates, Some("a")),
+            decide_target_at(&candidates, Some("a"), None, 0, GAP, URG, false, 0.0, now),
             Decision::Skip("所有账号到期都还早（最紧迫的还剩 5 天），无需切换".to_string())
         );
     }

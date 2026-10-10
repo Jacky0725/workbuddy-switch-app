@@ -480,11 +480,29 @@ pub fn export_accounts(account_ids: Vec<String>) -> Result<Value, String> {
         .map(|records| json!({ "ok": true, "accounts": records }))
 }
 
-/// POST /api/export-accounts-to-path —— 把公开元数据写入用户选择的路径。
+/// Desktop export path comes only from a Rust-owned native save dialog.
 #[tauri::command]
-pub fn export_accounts_to_path(account_ids: Vec<String>, path: String) -> Result<Value, String> {
-    export_import::export_accounts_to_path(&account_ids, &path)
-        .map(|path| json!({ "ok": true, "path": path }))
+pub async fn export_accounts_to_path(
+    app: tauri::AppHandle,
+    account_ids: Vec<String>,
+) -> Result<Value, String> {
+    use tauri_plugin_dialog::{DialogExt, FilePath};
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = app
+            .dialog()
+            .file()
+            .set_title("导出账号资料")
+            .set_file_name("workbuddy-manager-accounts.json")
+            .add_filter("JSON", &["json"])
+            .blocking_save_file();
+        let Some(FilePath::Path(path)) = selected else {
+            return Ok(json!({"ok":false,"cancelled":true}));
+        };
+        export_import::export_accounts_to_path(&account_ids, &path.to_string_lossy())
+            .map(|path| json!({ "ok": true, "path": path }))
+    })
+    .await
+    .map_err(|_| "导出对话框无法打开".to_string())?
 }
 
 /// POST /api/import/preview —— 解析导入文件并返回脱敏预览（含文件内索引）。
@@ -1479,4 +1497,44 @@ pub async fn list_notifications() -> Result<Value, String> {
 #[tauri::command]
 pub async fn clear_notifications() -> Result<(), String> {
     notifications::clear()
+}
+
+#[tauri::command]
+pub fn list_manager_backups(
+) -> Result<Vec<wb_switch_core::modules::manager_backup::BackupInfo>, String> {
+    wb_switch_core::modules::manager_backup::list_at(&wb_switch_core::modules::config::store_dir())
+}
+#[tauri::command]
+pub fn create_manager_backup() -> Result<wb_switch_core::modules::manager_backup::BackupInfo, String>
+{
+    wb_switch_core::modules::manager_backup::create_at(&wb_switch_core::modules::config::store_dir())
+}
+#[tauri::command]
+pub fn preview_manager_restore(
+    id: String,
+) -> Result<wb_switch_core::modules::manager_backup::RestorePreview, String> {
+    wb_switch_core::modules::manager_backup::preview_at(
+        &wb_switch_core::modules::config::store_dir(),
+        &id,
+    )
+}
+#[tauri::command]
+pub fn restore_manager_backup(
+    request: wb_switch_core::modules::manager_backup::RestoreRequest,
+) -> Result<wb_switch_core::modules::manager_backup::RestoreReport, String> {
+    wb_switch_core::modules::manager_backup::restore_at(
+        &wb_switch_core::modules::config::store_dir(),
+        request,
+    )
+}
+#[tauri::command]
+pub fn get_manager_logs() -> Result<Value, String> {
+    let root = wb_switch_core::modules::config::store_dir();
+    let tasks = wb_switch_core::modules::manager_scheduler::snapshot_at(
+        &root,
+        wb_switch_core::modules::config::now_ms(),
+    )?
+    .tasks;
+    let notifications = wb_switch_core::modules::notifications::list_at(&root)?;
+    Ok(json!({"tasks": tasks, "notifications": notifications}))
 }

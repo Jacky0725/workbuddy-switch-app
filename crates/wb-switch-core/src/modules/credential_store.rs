@@ -70,7 +70,7 @@ impl CredentialStore {
         let protected = protect(&plain, &context);
         plain.fill(0);
         let protected = protected?;
-        std::fs::create_dir_all(&self.root)?;
+        crate::modules::manager_security::private_directory(&self.root)?;
         write_ciphertext(&self.root.join(format!("{key}.dpapi")), &protected)?;
         Ok(CredentialReference {
             account_id: account_id.to_string(),
@@ -166,7 +166,7 @@ fn read_ciphertext(path: &Path) -> io::Result<Vec<u8>> {
 pub fn backup_legacy(root: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let encrypted = protect(bytes, b"WorkBuddyManager.accounts-backup.v1")?;
     let dir = root.join("backups");
-    std::fs::create_dir_all(&dir)?;
+    crate::modules::manager_security::private_directory(&dir)?;
     let path = dir.join(format!("accounts-legacy-{}.dpapi", uuid::Uuid::new_v4()));
     write_ciphertext(&path, &encrypted)?;
     // Check recoverability before publishing a migrated account index.
@@ -184,6 +184,13 @@ pub fn read_legacy_backup(path: &Path) -> io::Result<Vec<u8>> {
         &read_ciphertext(path)?,
         b"WorkBuddyManager.accounts-backup.v1",
     )
+}
+
+pub(crate) fn seal_backup(id: &str, bytes: &[u8]) -> io::Result<Vec<u8>> {
+    protect(bytes, format!("WorkBuddyManager.backup.v1:{id}").as_bytes())
+}
+pub(crate) fn open_backup(id: &str, bytes: &[u8]) -> io::Result<Vec<u8>> {
+    unprotect(bytes, format!("WorkBuddyManager.backup.v1:{id}").as_bytes())
 }
 
 #[cfg(windows)]
