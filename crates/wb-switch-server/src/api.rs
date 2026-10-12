@@ -1560,7 +1560,10 @@ fn manager_scheduler_routes(root: std::path::PathBuf) -> Router {
         }
     }
     async fn run() -> Response {
-        json_err(manager::run_now().unwrap_err(), StatusCode::FORBIDDEN)
+        match manager::run_now() {
+            Ok(()) => json_ok(json!({"status": "accepted"})),
+            Err(error) => json_err(error, StatusCode::FORBIDDEN),
+        }
     }
     Router::new()
         .route("/api/manager/scheduler", get(read).post(save))

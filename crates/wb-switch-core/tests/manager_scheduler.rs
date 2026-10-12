@@ -20,7 +20,7 @@ fn first_snapshot_is_readonly_and_does_not_claim_execution() {
     let fixture = Fixture::new();
     let snapshot = manager::snapshot_at(&fixture.0, NOW).unwrap();
     assert!(!fixture.0.exists());
-    assert!(snapshot.production_enabled);
+    assert!(!snapshot.production_enabled);
     assert!(!snapshot.config.enabled);
     assert!(snapshot.tasks.is_empty());
     assert!(snapshot.next_planned_at_ms.is_none());
@@ -50,7 +50,7 @@ fn saving_configuration_has_cas_and_never_touches_credentials() {
         NOW,
     )
     .unwrap();
-    assert!(saved.production_enabled);
+    assert!(!saved.production_enabled);
     assert_eq!(saved.config.daily_time, "10:30");
     assert_ne!(before.revision, saved.revision);
     let bytes = std::fs::read(fixture.0.join("daily_scheduler_config.json")).unwrap();
@@ -159,7 +159,7 @@ async fn background_poll_and_manual_request_cannot_reserve_or_send_a_checkin() {
     manager::background_tick_at(&fixture.0, NOW).await.unwrap();
     assert!(!fixture.0.join("daily_scheduler_state.json").exists());
     assert!(!fixture.0.join("daily_scheduler.lock").exists());
-    assert!(manager::run_now().is_ok());
+    assert_eq!(manager::run_now().unwrap_err(), manager::BLOCKED_REASON);
     let snapshot = manager::snapshot_at(&fixture.0, NOW).unwrap();
     assert!(snapshot.background_active);
     assert!(snapshot.tasks.is_empty());
