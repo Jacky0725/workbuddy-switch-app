@@ -146,6 +146,32 @@ pub fn switch_account(
     copy_session_ids: &[String],
     sync_selections: &[SyncSelection],
 ) -> Result<Value, String> {
+    let lease = crate::modules::client_operation_lock::ClientOperationLease::acquire(
+        &crate::modules::config::store_dir(),
+    )?;
+    switch_account_with_lease(
+        &lease,
+        progress_fn,
+        account_id,
+        restart,
+        share_sessions,
+        copy_session_ids,
+        sync_selections,
+    )
+}
+
+/// A future UI check-in runner may hold the same lease across switch and UI
+/// verification; it must not reacquire the lock while switching each account.
+#[allow(dead_code)]
+pub(crate) fn switch_account_with_lease(
+    _lease: &crate::modules::client_operation_lock::ClientOperationLease,
+    progress_fn: Option<&ProgressFn>,
+    account_id: &str,
+    restart: bool,
+    share_sessions: bool,
+    copy_session_ids: &[String],
+    sync_selections: &[SyncSelection],
+) -> Result<Value, String> {
     let _ = crate::modules::notifications::record("info", "开始账号切换", None);
     let result = switch_account_inner(
         progress_fn,
