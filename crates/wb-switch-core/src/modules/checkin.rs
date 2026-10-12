@@ -205,7 +205,7 @@ fn status_from_response(resp: &Value) -> Option<Value> {
     }))
 }
 
-/// 查询签到状态：新接口 checkin-activity-status，失败回退 checkin-status。
+/// 查询签到状态：仅在新接口明确返回 404 时回退 checkin-status。
 ///
 /// `checkin-activity-status` / `checkin-status` 是**国内版专有**接口；国际版没有
 /// 对应实现（也没有签到本身）。因此国际版不发起任何请求，直接返回
@@ -213,27 +213,37 @@ fn status_from_response(resp: &Value) -> Option<Value> {
 pub async fn get_checkin_status(account: &Value) -> Value {
     if variant_of(account) == WbVariant::Cn {
         let resp = checkin_request("/checkin-activity-status", account).await;
-        if let Some(status) = status_from_response(&resp) {
-            return status;
+        if let Some(result) = primary_status_result(&resp) {
+            return result;
         }
         let resp2 = checkin_request("/checkin-status", account).await;
         if let Some(status) = status_from_response(&resp2) {
             return status;
         }
-        let code2 = resp2.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-        return json!({
-            "ok": false,
-            "error": resp2.get("message")
-                .or_else(|| resp2.get("msg"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(&format!("code={code2}"))
-                .to_string(),
-        });
+        return status_error_from_response(&resp2);
     }
     json!({
         "ok": false,
         "statusUnsupported": true,
         "error": "该档位暂无签到状态接口",
+    })
+}
+
+/// `None` alone permits a request to the legacy path; auth and server errors stop here.
+fn primary_status_result(resp: &Value) -> Option<Value> {
+    status_from_response(resp)
+        .or_else(|| (!is_route_missing(resp)).then(|| status_error_from_response(resp)))
+}
+
+fn status_error_from_response(resp: &Value) -> Value {
+    let code = resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    json!({
+        "ok": false,
+        "error": resp.get("message")
+            .or_else(|| resp.get("msg"))
+            .and_then(Value::as_str)
+            .unwrap_or(&format!("code={code}"))
+            .to_string(),
     })
 }
 
@@ -1165,6 +1175,26 @@ mod tests {
         }))
         .expect("camelCase 也应解析");
         assert_eq!(snake["todayCheckedIn"], false);
+    }
+
+    #[test]
+    fn status_fallback_requires_an_explicit_missing_route() {
+        for response in [
+            json!({"code": 401, "message": "登录已过期"}),
+            json!({"code": 403, "message": "权限不足"}),
+            json!({"code": 429, "message": "请求过快"}),
+            json!({"code": 500, "message": "服务不可用"}),
+        ] {
+            let result = primary_status_result(&response).expect("不得换路径重试");
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["error"], response["message"]);
+        }
+        assert!(primary_status_result(&json!({"code": 404})).is_none());
+        assert_eq!(
+            primary_status_result(&json!({"code": 0, "data": {"today_checked_in": true}})).unwrap()
+                ["todayCheckedIn"],
+            true
+        );
     }
 
     /// 路径候选：国际版先 /billing/meter/... 再回落 /v2/billing/meter/...。
