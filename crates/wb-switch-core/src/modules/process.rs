@@ -1140,31 +1140,61 @@ fn close_workbuddy_windows(variant: WbVariant, timeout_secs: i64) -> Result<(), 
         return Ok(());
     }
     let pids: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+    let mut close_command_failed = false;
     for pid in &pids {
         let pid_s = pid.to_string();
-        let _ = run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T"], 10);
+        if !run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T"], 10)
+            .is_some_and(|result| result.status.success())
+        {
+            close_command_failed = true;
+        }
     }
 
     let started = Instant::now();
     let timeout = Duration::from_secs(timeout_secs.max(1) as u64);
     let graceful_budget = Duration::from_secs(8).min(timeout);
     let remaining = wait_windows_pids_gone(&pids, graceful_budget);
-    if remaining.is_empty() {
+    if remaining.is_empty() && windows_workbuddy_process_rows(variant).is_empty() {
         return Ok(());
     }
 
-    for pid in &remaining {
+    let force_pids: Vec<u32> = if remaining.is_empty() {
+        windows_workbuddy_process_rows(variant)
+            .into_iter()
+            .map(|row| row.pid)
+            .collect()
+    } else {
+        remaining
+    };
+    for pid in &force_pids {
         let pid_s = pid.to_string();
-        let _ = run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T", "/F"], 10);
+        if !run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T", "/F"], 10)
+            .is_some_and(|result| result.status.success())
+        {
+            close_command_failed = true;
+        }
     }
     let rest = timeout
         .saturating_sub(started.elapsed())
         .max(Duration::from_secs(1));
-    let leftover = wait_windows_pids_gone(&remaining, rest);
+    let _ = wait_windows_pids_gone(&force_pids, rest);
+    let leftover = windows_workbuddy_process_rows(variant);
     if leftover.is_empty() {
         return Ok(());
     }
-    Err("WorkBuddy 进程无法关闭，请手动结束 WorkBuddy/CodeBuddy 进程".to_string())
+    let pids = leftover
+        .iter()
+        .map(|row| row.pid.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reason = if close_command_failed {
+        "关闭命令失败，可能是客户端使用了更高权限；"
+    } else {
+        "关闭后仍检测到客户端进程；"
+    };
+    Err(format!(
+        "WorkBuddy 进程无法关闭（残留 PID: {pids}）。{reason}请在任务管理器中退出这些进程后重试"
+    ))
 }
 
 /// 启动 WorkBuddy。失败返回可读错误。对照 `launch_workbuddy`。
