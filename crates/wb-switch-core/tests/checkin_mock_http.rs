@@ -177,7 +177,11 @@ fn account(id: &str) -> CheckinAccount {
 
 #[tokio::test]
 async fn success_is_logged_once_and_repeated_trigger_does_not_submit_again() {
-    let f = Fixture::new(vec![step("status", 200, NO), step("submit", 200, SUCCESS)]);
+    let f = Fixture::new(vec![
+        step("status", 200, NO),
+        step("submit", 200, SUCCESS),
+        step("status", 200, YES),
+    ]);
     let service = f.service();
     let cancel = CancellationToken::default();
     assert_eq!(
@@ -200,6 +204,21 @@ async fn success_is_logged_once_and_repeated_trigger_does_not_submit_again() {
 async fn strict_status_and_error_matrix_never_submits_on_missing_or_changed_fields() {
     for (http, body, expected) in [
         (200, YES, S::AlreadyCompleted),
+        (
+            200,
+            r#"{"today_checked_in":true,"active":true}"#,
+            S::AlreadyCompleted,
+        ),
+        (
+            200,
+            r#"{"today_checked_in":false,"active":false}"#,
+            S::Unsupported,
+        ),
+        (
+            200,
+            r#"{"today_checked_in":false,"active":"false"}"#,
+            S::Unknown,
+        ),
         (401, r#"{"message":"fake-secret-echo"}"#, S::AuthExpired),
         (403, "{}", S::RequiresUserAction),
         (428, "{}", S::RequiresUserAction),
@@ -253,6 +272,8 @@ async fn strict_status_and_error_matrix_never_submits_on_missing_or_changed_fiel
 async fn submit_response_requires_explicit_business_code_and_data_object() {
     for (http, body, expected, uncertain) in [
         (200, SUCCESS, S::Success, false),
+        (200, r#"{"credit":100}"#, S::Success, false),
+        (200, r#"{"credit":"100"}"#, S::Unknown, true),
         (
             200,
             r#"{"code":0,"data":{"alreadyCompleted":true}}"#,
@@ -265,6 +286,12 @@ async fn submit_response_requires_explicit_business_code_and_data_object() {
         (401, "{}", S::AuthExpired, false),
         (429, "{}", S::RateLimited, false),
         (500, "{}", S::ServerError, true),
+        (
+            400,
+            r#"{"code":10001,"msg":"今天已签到，请明天再来"}"#,
+            S::AlreadyCompleted,
+            false,
+        ),
         (
             400,
             r#"{"code":10001,"msg":"今天已签到","data":{}}"#,
@@ -284,7 +311,11 @@ async fn submit_response_requires_explicit_business_code_and_data_object() {
             true,
         ),
     ] {
-        let f = Fixture::new(vec![step("status", 200, NO), step("submit", http, body)]);
+        let mut steps = vec![step("status", 200, NO), step("submit", http, body)];
+        if matches!(expected, S::Success | S::AlreadyCompleted) {
+            steps.push(step("status", 200, YES));
+        }
+        let f = Fixture::new(steps);
         let result = f
             .service()
             .checkin(&account("a"), DAY, &CancellationToken::default())
@@ -295,6 +326,41 @@ async fn submit_response_requires_explicit_business_code_and_data_object() {
         );
         f.assert_drained();
     }
+}
+
+#[tokio::test]
+async fn direct_activity_status_submits_once_with_explicit_credit_receipt() {
+    let f = Fixture::new(vec![
+        step("status", 200, r#"{"today_checked_in":false,"active":true}"#),
+        step("submit", 200, r#"{"credit":100}"#),
+        step("status", 200, YES),
+    ]);
+    let result = f
+        .service()
+        .checkin(&account("a"), DAY, &CancellationToken::default())
+        .await;
+    assert_eq!(result.status, S::Success);
+    assert_eq!(f.count("/submit"), 1);
+    f.assert_drained();
+}
+
+#[tokio::test]
+async fn successful_receipt_without_server_status_confirmation_stays_uncertain() {
+    let f = Fixture::new(vec![
+        step("status", 200, NO),
+        step("submit", 200, SUCCESS),
+        step("status", 200, NO),
+    ]);
+    let result = f
+        .service()
+        .checkin(&account("a"), DAY, &CancellationToken::default())
+        .await;
+    assert_eq!(
+        (result.status, result.may_have_completed),
+        (S::Unknown, true)
+    );
+    assert_eq!(f.count("/submit"), 1);
+    f.assert_drained();
 }
 
 #[tokio::test]
@@ -345,7 +411,11 @@ async fn unresolved_timeout_preserves_uncertainty_and_subsequent_trigger_only_qu
 async fn concurrent_duplicate_is_in_progress_and_uses_one_submission() {
     let mut delayed = step("status", 200, NO);
     delayed.delay = Duration::from_millis(80);
-    let f = Fixture::new(vec![delayed, step("submit", 200, SUCCESS)]);
+    let f = Fixture::new(vec![
+        delayed,
+        step("submit", 200, SUCCESS),
+        step("status", 200, YES),
+    ]);
     let service = f.service();
     let (account, cancel) = (account("a"), CancellationToken::default());
     let (a, b) = tokio::join!(
@@ -363,6 +433,7 @@ async fn three_accounts_partial_failure_and_rate_limit_do_not_abort_the_batch() 
     let f = Fixture::new(vec![
         step("status", 200, NO),
         step("submit", 200, SUCCESS),
+        step("status", 200, YES),
         step("status", 401, "{}"),
         step("status", 429, "{}"),
     ]);
@@ -387,7 +458,7 @@ async fn three_accounts_partial_failure_and_rate_limit_do_not_abort_the_batch() 
         S::RateLimited
     );
     let calls = f.calls.lock().unwrap();
-    assert_eq!(calls.len(), 4);
+    assert_eq!(calls.len(), 5);
     assert!(calls
         .windows(2)
         .all(|v| v[1].2.duration_since(v[0].2) >= Duration::from_millis(10)));
@@ -529,7 +600,11 @@ async fn persistent_scheduler_uses_the_http_engine_and_does_not_repeat_after_res
     }
     let dir =
         StateDir(std::env::temp_dir().join(format!("wbm-http-scheduler-{}", uuid::Uuid::new_v4())));
-    let f = Fixture::new(vec![step("status", 200, NO), step("submit", 200, SUCCESS)]);
+    let f = Fixture::new(vec![
+        step("status", 200, NO),
+        step("submit", 200, SUCCESS),
+        step("status", 200, YES),
+    ]);
     let config = SchedulerConfig {
         enabled: true,
         ..SchedulerConfig::default()

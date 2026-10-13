@@ -257,8 +257,8 @@ export default function AccountsPage() {
   const checkinAvailable = variantSupportsCheckin(variant) && (api.isDemoMode() || managerSchedule?.production_enabled === true);
   /** 旅行 chip 与旅行状态轮询只在自动旅行开启后生效（配置未读到 = 未开启）。 */
   const autoTravelEnabled = travelAvailable && autoTravelConfig?.enabled === true;
-  /** 刷新按钮文案：国际版没有签到接口，只刷新积分。 */
-  const refreshCreditsLabel = checkinAvailable ? "刷新全部账号积分并签到（仅在签到时间段内签到；忽略已关闭自动签到的账号）" : "刷新全部账号积分";
+  /** 签到由 Manager 的独立调度入口执行；积分刷新仍是独立能力。 */
+  const refreshCreditsLabel = "刷新全部账号积分";
   /** 关闭自动签到的账号 id（配置未读到/读取失败 = 空名单）。 */
   const excludedCheckinIds = useMemo(
     () => new Set(autoCheckinConfig?.excluded_account_ids ?? []),
@@ -266,11 +266,11 @@ export default function AccountsPage() {
   );
   /** 今日签到状态只查未关闭自动签到的账号；配置就绪前不发请求。 */
   const autoCheckinAccountIds = useMemo(() => {
-    if (!checkinAvailable || !autoCheckinSettled) return [];
+    if (!checkinAvailable || !autoCheckinSettled || managerSchedule) return [];
     return visibleAccounts
       .filter((account) => !excludedCheckinIds.has(account.id))
       .map((account) => account.id);
-  }, [visibleAccounts, checkinAvailable, autoCheckinSettled, excludedCheckinIds]);
+  }, [visibleAccounts, checkinAvailable, autoCheckinSettled, excludedCheckinIds, managerSchedule]);
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
   const [compact, setCompact] = useState<boolean>(() => {
     try {
@@ -623,6 +623,17 @@ export default function AccountsPage() {
 
   async function onCheckin(a: AccountMeta) {
     try {
+      if (managerSchedule?.production_enabled) {
+        await api.runManagerCheckin(a.id);
+        const next = await api.getManagerScheduler();
+        setManagerSchedule(next);
+        const task = currentTask(next, a);
+        const status = task && typeof task.state !== "string" ? task.state.Finished : undefined;
+        const description = `${displayName(a)}：${taskLabel(task)}`;
+        if (status === "Success" || status === "AlreadyCompleted") toast.success("签到已核实", { description });
+        else toast.info("签到状态待核实", { description });
+        return;
+      }
       const res = await api.checkin(a.id);
       const label =
         res.result === "success"
@@ -669,7 +680,7 @@ export default function AccountsPage() {
     let notify = toast.success;
     let title = "积分到期情况已刷新";
     try {
-      if (checkinAvailable) {
+      if (checkinAvailable && !managerSchedule) {
         try {
           const res = await api.checkinAll(variant, true);
           const entries = res.accounts ?? [];
@@ -715,6 +726,14 @@ export default function AccountsPage() {
       }
       await refreshCredits(ids);
       if (autoTravelEnabled) await loadTravelMap(ids);
+      const latestCredits = useAccountsStore.getState().creditMap;
+      const unavailable = ids.filter((id) => latestCredits[id]?.ok !== true).length;
+      if (unavailable > 0) {
+        notify = toast.info;
+        title = unavailable === ids.length ? "积分查询尚不可用" : "部分账号积分未能查询";
+        const detail = `${unavailable} 个账号的积分状态未得到验证`;
+        summary = summary ? `${summary}；${detail}` : detail;
+      }
       notify(title, { description: summary || undefined });
     } finally {
       setCheckinAllRunning(false);

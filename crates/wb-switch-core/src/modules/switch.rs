@@ -164,7 +164,7 @@ pub fn switch_account(
 /// verification; it must not reacquire the lock while switching each account.
 #[allow(dead_code)]
 pub(crate) fn switch_account_with_lease(
-    _lease: &crate::modules::client_operation_lock::ClientOperationLease,
+    lease: &crate::modules::client_operation_lock::ClientOperationLease,
     progress_fn: Option<&ProgressFn>,
     account_id: &str,
     restart: bool,
@@ -174,6 +174,7 @@ pub(crate) fn switch_account_with_lease(
 ) -> Result<Value, String> {
     let _ = crate::modules::notifications::record("info", "开始账号切换", None);
     let result = switch_account_inner(
+        lease,
         progress_fn,
         account_id,
         restart,
@@ -193,6 +194,7 @@ pub(crate) fn switch_account_with_lease(
     result
 }
 fn switch_account_inner(
+    lease: &crate::modules::client_operation_lock::ClientOperationLease,
     progress_fn: Option<&ProgressFn>,
     account_id: &str,
     restart: bool,
@@ -226,18 +228,23 @@ fn switch_account_inner(
     let mut session_report: Option<Value> = None;
     let mut sync_report: Option<Value> = None;
     let mut recovery_report: Option<Value> = None;
+    let attempts_session_writes = !copy_session_ids.is_empty() || !sync_selections.is_empty();
     if restart {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
         // 关进程后先恢复未完成的会话写入：恢复成功或复制侧可安全延后重试的失败
         // 不阻断切换；同步仍未完成、拿不到锁或中间产物异常则暂停启动（design §4 / §5）。
-        let recovery = match session::recover_pending_session_operations(variant) {
-            Ok(report) => report,
-            Err(error) => {
-                return Err(format!(
-                    "无法恢复未完成的会话写入（{error}），已暂停切换与启动 WorkBuddy；请稍后重试"
-                ));
+        let recovery = if attempts_session_writes {
+            match session::recover_pending_session_operations_with_lease(lease, variant) {
+                Ok(report) => report,
+                Err(error) => {
+                    return Err(format!(
+                        "无法恢复未完成的会话写入（{error}），已暂停切换与启动 WorkBuddy；请稍后重试"
+                    ));
+                }
             }
+        } else {
+            RecoveryReport::default()
         };
         let blocking = recovery_blocks_startup(&recovery);
         if !recovery.is_empty() {
@@ -251,7 +258,6 @@ fn switch_account_inner(
         }
         // 本次是否请求了会话写入；同时记下写入前已存在的未完成记录，供写入后比对。
         let ops_paths = SessionPaths::for_variant(variant);
-        let attempts_session_writes = !copy_session_ids.is_empty() || !sync_selections.is_empty();
         let pending_before = if attempts_session_writes {
             pending_operation_ids(&ops_paths, variant)
         } else {
@@ -262,7 +268,7 @@ fn switch_account_inner(
             // 复制失败本身只记进报告、不阻断切换；但若本次留下了未完成的写入，
             // 会在复制与同步都跑完后统一暂停切换与启动（见下方 pending 差集检查）。
             copy_report = Some(
-                match session::copy_sessions_for_switch(&acc, copy_session_ids) {
+                match session::copy_sessions_for_switch_with_lease(lease, &acc, copy_session_ids) {
                     Ok(report) => report,
                     // 档位锁被占用或无法建立互斥：此时可能另有会话写入正在进行，
                     // 不能当成普通复制失败后继续写认证并启动 App。锁失败文案前缀
@@ -283,7 +289,7 @@ fn switch_account_inner(
             // 同步与复制顺序执行（同一把档位锁），不重复写入。
             progress("正在同步会话到目标账号…");
             sync_report = Some(
-                match session::sync_sessions_for_switch(&acc, sync_selections) {
+                match session::sync_sessions_for_switch_with_lease(lease, &acc, sync_selections) {
                     Ok(report) => report,
                     Err(error)
                         if error.starts_with(LOCK_BUSY_MESSAGE_PREFIX)

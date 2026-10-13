@@ -1150,9 +1150,8 @@ pub fn save_manager_scheduler(
 }
 
 #[tauri::command]
-pub fn run_manager_checkin(account_id: Option<String>) -> Result<(), String> {
-    let _ = account_id;
-    wb_switch_core::modules::manager_scheduler::run_now()
+pub async fn run_manager_checkin(account_id: Option<String>) -> Result<(), String> {
+    wb_switch_core::modules::manager_scheduler::run_now(account_id.as_deref()).await
 }
 
 /// GET /api/checkin/logs —— 签到日志（每行带 `variant`，便于前端按档位过滤）。

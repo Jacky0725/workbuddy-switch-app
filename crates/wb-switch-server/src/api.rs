@@ -1559,8 +1559,16 @@ fn manager_scheduler_routes(root: std::path::PathBuf) -> Router {
             Err(error) => json_err(error, StatusCode::BAD_REQUEST),
         }
     }
-    async fn run() -> Response {
-        match manager::run_now() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct RunBody {
+        account_id: Option<String>,
+    }
+    async fn run(State(root): State<std::path::PathBuf>, Json(body): Json<RunBody>) -> Response {
+        if root != config::store_dir() {
+            return json_err(manager::BLOCKED_REASON.to_string(), StatusCode::FORBIDDEN);
+        }
+        match manager::run_now(body.account_id.as_deref()).await {
             Ok(()) => json_ok(json!({"status": "accepted"})),
             Err(error) => json_err(error, StatusCode::FORBIDDEN),
         }

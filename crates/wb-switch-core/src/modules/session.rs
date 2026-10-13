@@ -731,8 +731,17 @@ pub fn copy_sessions_for_switch(
     target_acc: &Value,
     session_ids: &[String],
 ) -> Result<Value, String> {
-    crate::modules::session_safety::require_verified_client()?;
+    let lease = crate::modules::client_operation_lock::ClientOperationLease::acquire(&store_dir())?;
+    copy_sessions_for_switch_with_lease(&lease, target_acc, session_ids)
+}
+
+pub(crate) fn copy_sessions_for_switch_with_lease(
+    _lease: &crate::modules::client_operation_lock::ClientOperationLease,
+    target_acc: &Value,
+    session_ids: &[String],
+) -> Result<Value, String> {
     let variant = account::variant_of(target_acc);
+    crate::modules::session_safety::require_verified_local_client(variant)?;
     let paths = SessionPaths::for_variant(variant);
     copy_sessions_for_switch_at(
         &paths,
@@ -1231,6 +1240,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
             return Err(format!("会话内容无法验证（{reason}），未复制"));
         }
     };
+    crate::modules::session_safety::validate_self_contained_body(&snapshot.text)?;
     let source_owner = session_row_owner(context.source_paths, cid);
     match source_owner.as_deref() {
         Some(owner) if owner == context.source_uid => {}
@@ -1709,7 +1719,15 @@ pub fn parse_sync_selections(value: Option<&Value>) -> Result<Vec<SyncSelection>
 /// 成员当前正文状态；`projects/` 下找不到正文一律按 Missing（不当作空正文）。
 pub(crate) fn member_content_state(paths: &SessionPaths, session_id: &str) -> ContentState {
     match find_project_jsonl(paths, session_id) {
-        Some(path) => session_link::read_content_snapshot(&path, session_id),
+        Some(path) => match session_link::read_content_snapshot(&path, session_id) {
+            ContentState::Ready(snapshot) => {
+                match crate::modules::session_safety::validate_self_contained_body(&snapshot.text) {
+                    Ok(()) => ContentState::Ready(snapshot),
+                    Err(reason) => ContentState::Unavailable(reason),
+                }
+            }
+            other => other,
+        },
         None => ContentState::Missing,
     }
 }
@@ -2304,8 +2322,17 @@ pub fn sync_sessions_for_switch(
     target_acc: &Value,
     selections: &[SyncSelection],
 ) -> Result<Value, String> {
-    crate::modules::session_safety::require_verified_client()?;
+    let lease = crate::modules::client_operation_lock::ClientOperationLease::acquire(&store_dir())?;
+    sync_sessions_for_switch_with_lease(&lease, target_acc, selections)
+}
+
+pub(crate) fn sync_sessions_for_switch_with_lease(
+    _lease: &crate::modules::client_operation_lock::ClientOperationLease,
+    target_acc: &Value,
+    selections: &[SyncSelection],
+) -> Result<Value, String> {
     let variant = account::variant_of(target_acc);
+    crate::modules::session_safety::require_verified_local_client(variant)?;
     let paths = SessionPaths::for_variant(variant);
     sync_sessions_for_switch_at(
         &paths,
@@ -3583,10 +3610,37 @@ where
 
 /// 生产入口：自行获取档位操作锁后恢复（被占用时返回明确错误，不排队）。
 pub fn recover_pending_session_operations(variant: WbVariant) -> Result<RecoveryReport, String> {
+    let lease = crate::modules::client_operation_lock::ClientOperationLease::acquire(&store_dir())?;
+    recover_pending_session_operations_with_lease(&lease, variant)
+}
+
+pub(crate) fn recover_pending_session_operations_with_lease(
+    _lease: &crate::modules::client_operation_lock::ClientOperationLease,
+    variant: WbVariant,
+) -> Result<RecoveryReport, String> {
+    crate::modules::session_safety::require_verified_local_client(variant)?;
     let paths = SessionPaths::for_variant(variant);
-    crate::modules::session_safety::preflight_switch(&paths, variant, false)?;
-    // No writes/cleanup are allowed until the production compatibility gate is opened.
-    Ok(RecoveryReport::default())
+    if process::is_workbuddy_running(variant) {
+        return Err(SESSION_COPY_APP_RUNNING.into());
+    }
+    let scan = session_link::scan_operations(&paths);
+    if !scan.complete || !scan.problems.is_empty() {
+        return Err("会话操作记录无法完整读取，已停止恢复".into());
+    }
+    if scan.operations.iter().any(|operation| {
+        operation.variant == variant
+            && operation.phase.is_unfinished()
+            && operation
+                .source_variant
+                .is_some_and(|source| source != variant)
+    }) {
+        return Err("存在跨档会话操作，当前仅支持国内版本地会话恢复".into());
+    }
+    let _ops_lock = session_link::try_acquire_variant_ops_lock(&paths, variant)?;
+    if process::is_workbuddy_running(variant) {
+        return Err(SESSION_COPY_APP_RUNNING.into());
+    }
+    Ok(recover_pending_session_operations_at(&paths, variant))
 }
 
 enum RecoverOutcome {

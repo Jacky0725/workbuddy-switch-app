@@ -268,14 +268,37 @@ impl<C: Clock, E: ScheduledExecutor> DailyScheduler<C, E> {
         accounts: &[CheckinAccount],
         cancel: &CancellationToken,
     ) -> io::Result<TickResult> {
+        self.tick_with_mode(accounts, cancel, false, None).await
+    }
+
+    /// Manual execution uses the same durable task journal and account lock,
+    /// but may start before the configured daily time or while the plan is off.
+    pub async fn tick_manual(
+        &self,
+        accounts: &[CheckinAccount],
+        cancel: &CancellationToken,
+        account_id: Option<&str>,
+    ) -> io::Result<TickResult> {
+        self.tick_with_mode(accounts, cancel, true, account_id)
+            .await
+    }
+
+    async fn tick_with_mode(
+        &self,
+        accounts: &[CheckinAccount],
+        cancel: &CancellationToken,
+        manual: bool,
+        account_id: Option<&str>,
+    ) -> io::Result<TickResult> {
         let (hour, minute) = self.config.validate()?;
-        if !self.config.enabled || cancel.is_cancelled() {
+        if !manual && !self.config.enabled || cancel.is_cancelled() {
             return Ok(TickResult::default());
         }
         // Hold across requests. A crash releases the OS lock but leaves Pending on disk.
         let _lock = self.lock()?;
         let now = self.clock.now_ms();
-        let (date, scheduled) = schedule(now, hour, minute)?;
+        let (date, planned) = schedule(now, hour, minute)?;
+        let scheduled = if manual { now } else { planned };
         let mut journal = self.snapshot()?;
         if journal
             .latest_business_date
@@ -294,6 +317,9 @@ impl<C: Clock, E: ScheduledExecutor> DailyScheduler<C, E> {
         }
         let mut result = TickResult::default();
         for account in accounts {
+            if account_id.is_some_and(|target| target != account.id) {
+                continue;
+            }
             let current = self.clock.now_ms();
             if cancel.is_cancelled()
                 || current < scheduled
@@ -350,7 +376,11 @@ impl<C: Clock, E: ScheduledExecutor> DailyScheduler<C, E> {
             {
                 continue;
             }
-            if task.attempts == 0 && !self.config.catch_up && current >= scheduled + 60_000 {
+            if !manual
+                && task.attempts == 0
+                && !self.config.catch_up
+                && current >= scheduled + 60_000
+            {
                 task.state = TaskState::Missed;
                 self.save(&journal)?;
                 continue;

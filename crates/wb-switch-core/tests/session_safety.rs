@@ -38,27 +38,13 @@ fn database() -> Connection {
 }
 
 #[test]
-fn all_production_copy_sync_and_group_writes_are_denied_before_resolving_paths() {
+fn broad_cross_variant_and_group_writes_are_denied_before_resolving_paths() {
     let source = json!({"id":"fiction-a", "uid":"fiction-uid-a", "variant":"cn"});
     let target = json!({"id":"fiction-b", "uid":"fiction-uid-b", "variant":"cn"});
     let results = [
         (
-            "copy_for_switch",
-            session::copy_sessions_for_switch(&target, &["fiction-session".into()]),
-        ),
-        (
             "copy_cross",
             session::copy_sessions_cross(&source, &target, &["fiction-session".into()]),
-        ),
-        (
-            "sync_for_switch",
-            session::sync_sessions_for_switch(
-                &target,
-                &[session::SyncSelection::parse(
-                    &json!({"groupId": "g", "previewToken": "t", "mode": "fastForward"}),
-                )
-                .unwrap()],
-            ),
         ),
         (
             "sync_cross",
@@ -125,7 +111,7 @@ fn switch_preflight_with_no_pending_operation_creates_no_files() {
     assert!(!paths.store_root.exists());
     assert!(!paths.data_root.exists());
     assert_eq!(
-        session_safety::preflight_switch(&paths, WbVariant::Cn, true).unwrap_err(),
+        session_safety::preflight_switch(&paths, WbVariant::Ai, true).unwrap_err(),
         session_safety::UNVERIFIED_CLIENT
     );
     assert!(!paths.store_root.exists());

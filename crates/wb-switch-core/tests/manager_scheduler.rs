@@ -159,7 +159,8 @@ async fn background_poll_and_manual_request_cannot_reserve_or_send_a_checkin() {
     manager::background_tick_at(&fixture.0, NOW).await.unwrap();
     assert!(!fixture.0.join("daily_scheduler_state.json").exists());
     assert!(!fixture.0.join("daily_scheduler.lock").exists());
-    assert_eq!(manager::run_now().unwrap_err(), manager::BLOCKED_REASON);
+    // Fixture roots remain isolated from live account credentials. The real
+    // manual entry is exercised through the production account store.
     let snapshot = manager::snapshot_at(&fixture.0, NOW).unwrap();
     assert!(snapshot.background_active);
     assert!(snapshot.tasks.is_empty());

@@ -236,6 +236,28 @@ fn configuration_defaults_validation_and_roundtrip() {
 }
 
 #[tokio::test]
+async fn manual_run_before_schedule_is_targeted_and_durable() {
+    let f = Fixture::new();
+    let c = TestClock::at(9, 8, 0);
+    let e = Executor::new(vec![]);
+    let s = scheduler(&f, &c, &e, SchedulerConfig::default());
+    let cancel = CancellationToken::default();
+    let accounts = [account("a"), account("b")];
+    let first = s.tick_manual(&accounts, &cancel, Some("b")).await.unwrap();
+    assert_eq!(first.executed.len(), 1);
+    assert_eq!(first.executed[0].account_id, "b");
+    assert_eq!(e.count(), 1);
+    assert!(s
+        .tick_manual(&accounts, &cancel, Some("b"))
+        .await
+        .unwrap()
+        .executed
+        .is_empty());
+    assert_eq!(e.count(), 1);
+    assert_eq!(s.snapshot().unwrap().tasks.len(), 1);
+}
+
+#[tokio::test]
 async fn before_due_at_due_after_due_and_backward_time_only_execute_once() {
     let f = Fixture::new();
     let c = TestClock::at(9, 9, 14);

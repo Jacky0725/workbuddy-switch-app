@@ -104,6 +104,134 @@ impl CheckinAdapter for DisabledProductionAdapter {
     }
 }
 
+/// Fixed-host transport for accounts that have a separate, verified Checkin
+/// capability grant. The current desktop-switch token is read only after that
+/// grant exists; callers cannot supply a URL or redirect target.
+pub struct OfficialCheckinAdapter {
+    credentials: HashMap<String, OfficialCredential>,
+    client: reqwest::Client,
+}
+
+struct OfficialCredential {
+    uid: String,
+    token: String,
+}
+
+impl OfficialCheckinAdapter {
+    pub fn from_accounts(accounts: &[Value], timeout: Duration) -> Result<Self, &'static str> {
+        if timeout.is_zero() || timeout > Duration::from_secs(30) {
+            return Err("签到请求超时设置无效");
+        }
+        let mut credentials = HashMap::new();
+        for account in accounts {
+            let grant = &account["capability_credentials"]["Checkin"];
+            if grant["verified_for"] != "copilot.tencent.com/v2/billing/meter"
+                || grant["authorized"] != true
+                || account["credential_locked"] == true
+                || account["needs_relogin"] == true
+                || account["region"] != "cn"
+            {
+                continue;
+            }
+            let Some(id) = account["id"].as_str().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            let Some(uid) = account["uid"]
+                .as_str()
+                .filter(|value| valid_header_value(value))
+            else {
+                continue;
+            };
+            let Some(token) = account["access_token"]
+                .as_str()
+                .filter(|value| valid_access_token(value))
+            else {
+                continue;
+            };
+            credentials.insert(
+                id.to_string(),
+                OfficialCredential {
+                    uid: uid.to_string(),
+                    token: token.to_string(),
+                },
+            );
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .build()
+            .map_err(|_| "签到 HTTP 客户端初始化失败")?;
+        Ok(Self {
+            credentials,
+            client,
+        })
+    }
+
+    pub fn has_account(&self, account_id: &str) -> bool {
+        self.credentials.contains_key(account_id)
+    }
+}
+
+fn valid_header_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 2048
+        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+fn valid_access_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32_768
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._~+/-=".contains(&byte))
+}
+
+impl CheckinAdapter for OfficialCheckinAdapter {
+    fn request<'a>(
+        &'a self,
+        account_id: &'a str,
+        operation: CheckinOperation,
+    ) -> AdapterFuture<'a> {
+        Box::pin(async move {
+            let credential = self
+                .credentials
+                .get(account_id)
+                .ok_or(AdapterError::Disabled)?;
+            let path = match operation {
+                CheckinOperation::Status => "checkin-activity-status",
+                CheckinOperation::Submit => "daily-checkin",
+            };
+            let url = format!("https://copilot.tencent.com/v2/billing/meter/{path}");
+            let mut response = self
+                .client
+                .post(url)
+                .header("Accept", "application/json")
+                .header("Authorization", format!("Bearer {}", credential.token))
+                .header("Content-Type", "application/json")
+                .header("X-User-Id", &credential.uid)
+                .header("User-Agent", "WorkBuddy")
+                .send()
+                .await
+                .map_err(adapter_error)?;
+            let status = response.status().as_u16();
+            let mut bytes = vec![];
+            while let Some(chunk) = response.chunk().await.map_err(adapter_error)? {
+                if bytes.len() + chunk.len() > 65_536 {
+                    return Ok(AdapterResponse {
+                        http_status: status,
+                        body: Value::Null,
+                    });
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(AdapterResponse {
+                http_status: status,
+                body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            })
+        })
+    }
+}
+
 /// Development transport: literal loopback IP, explicit port, no proxy/redirect,
 /// no token, no caller-selected operation path. Never exposed through host IPC.
 pub struct LoopbackCheckinAdapter {
@@ -382,13 +510,33 @@ impl<A: CheckinAdapter> CheckinService<A> {
                     {
                         Ok(response) => {
                             let status = parse_submit(&response);
-                            (
+                            if matches!(
                                 status,
-                                matches!(
+                                CheckinResultStatus::Success
+                                    | CheckinResultStatus::AlreadyCompleted
+                            ) {
+                                // A successful submit response is not yet proof that today's
+                                // server-side state changed. Never record success without an
+                                // independent status confirmation.
+                                match self
+                                    .request(&account.id, CheckinOperation::Status, cancel)
+                                    .await
+                                {
+                                    Ok(verification) if parse_status(&verification) == Ok(true) => {
+                                        (status, false)
+                                    }
+                                    _ => (CheckinResultStatus::Unknown, true),
+                                }
+                            } else {
+                                (
                                     status,
-                                    CheckinResultStatus::Unknown | CheckinResultStatus::ServerError
-                                ),
-                            )
+                                    matches!(
+                                        status,
+                                        CheckinResultStatus::Unknown
+                                            | CheckinResultStatus::ServerError
+                                    ),
+                                )
+                            }
                         }
                         Err(AdapterError::Timeout | AdapterError::Network) => {
                             // A timed-out POST is never retried inline. Verify exactly once.
@@ -449,6 +597,16 @@ fn response_data(response: &AdapterResponse) -> Result<&Value, CheckinResultStat
         200..=299 => {}
         _ => return Err(Unknown),
     }
+    // The desktop-facing endpoint observed by community tools returns the
+    // activity object directly. Keep the older {code,data} fixture contract
+    // separate; never infer success from an arbitrary object.
+    if response.body.get("code").is_none() {
+        return response
+            .body
+            .as_object()
+            .map(|_| &response.body)
+            .ok_or(Unknown);
+    }
     let code = response
         .body
         .get("code")
@@ -471,6 +629,12 @@ fn response_data(response: &AdapterResponse) -> Result<&Value, CheckinResultStat
 }
 fn parse_status(response: &AdapterResponse) -> Result<bool, CheckinResultStatus> {
     let data = response_data(response)?;
+    if data.get("active").is_some_and(|value| !value.is_boolean()) {
+        return Err(CheckinResultStatus::Unknown);
+    }
+    if data.get("active").and_then(Value::as_bool) == Some(false) {
+        return Err(CheckinResultStatus::Unsupported);
+    }
     let snake = data.get("today_checked_in");
     let camel = data.get("todayCheckedIn");
     match (snake, camel) {
@@ -492,17 +656,22 @@ fn parse_submit(response: &AdapterResponse) -> CheckinResultStatus {
         .to_ascii_lowercase();
     if matches!(response.http_status, 200..=299 | 400)
         && response.body.get("code").and_then(Value::as_i64) == Some(10001)
-        && response.body.get("data").is_some_and(Value::is_object)
-        && matches!(
-            repeat_message.as_str(),
-            "今天已签到" | "今日已签到" | "已签到" | "already checked in"
-        )
+        && (repeat_message.starts_with("今天已签到")
+            || repeat_message.starts_with("今日已签到")
+            || repeat_message == "已签到"
+            || repeat_message == "already checked in")
     {
         return CheckinResultStatus::AlreadyCompleted;
     }
     match response_data(response) {
         Ok(data) if data.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) => {
             CheckinResultStatus::AlreadyCompleted
+        }
+        Ok(data) if response.body.get("code").is_none() => {
+            match data.get("credit").and_then(Value::as_f64) {
+                Some(credit) if credit.is_finite() && credit > 0.0 => CheckinResultStatus::Success,
+                _ => CheckinResultStatus::Unknown,
+            }
         }
         Ok(_) => CheckinResultStatus::Success,
         Err(status) => status,
@@ -522,5 +691,53 @@ fn message(status: CheckinResultStatus) -> &'static str {
         Unknown => "结果不确定，请核实后处理",
         Cancelled => "任务已取消",
         InProgress => "同账号任务正在执行",
+    }
+}
+
+#[cfg(test)]
+mod official_adapter_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn official_transport_requires_separate_grant() {
+        let account = json!({
+            "id": "a", "uid": "owner", "region": "cn", "access_token": "fixture-token"
+        });
+        let adapter =
+            OfficialCheckinAdapter::from_accounts(&[account], Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            adapter.request("a", CheckinOperation::Status).await,
+            Err(AdapterError::Disabled)
+        ));
+    }
+
+    #[test]
+    fn malformed_credentials_cannot_enter_official_transport() {
+        let template = json!({
+            "id": "a", "uid": "owner", "region": "cn", "access_token": "fixture-token",
+            "capability_credentials": {"Checkin": {
+                "authorized": true,
+                "verified_for": "copilot.tencent.com/v2/billing/meter"
+            }}
+        });
+        let mut bad = template.clone();
+        bad["uid"] = json!("owner\r\nX-Injected: yes");
+        let adapter =
+            OfficialCheckinAdapter::from_accounts(&[bad], Duration::from_secs(5)).unwrap();
+        assert!(adapter.credentials.is_empty());
+        bad = template.clone();
+        bad["access_token"] = json!("fixture token");
+        let adapter =
+            OfficialCheckinAdapter::from_accounts(&[bad], Duration::from_secs(5)).unwrap();
+        assert!(adapter.credentials.is_empty());
+        bad = template.clone();
+        bad["capability_credentials"]["Checkin"]["verified_for"] = json!("example.com");
+        let adapter =
+            OfficialCheckinAdapter::from_accounts(&[bad], Duration::from_secs(5)).unwrap();
+        assert!(adapter.credentials.is_empty());
+        let adapter =
+            OfficialCheckinAdapter::from_accounts(&[template], Duration::from_secs(5)).unwrap();
+        assert_eq!(adapter.credentials.len(), 1);
     }
 }
