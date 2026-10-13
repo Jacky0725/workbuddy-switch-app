@@ -195,12 +195,25 @@ fn status_from_response(resp: &Value) -> Option<Value> {
         return None;
     }
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
+    let snake = data.get("today_checked_in");
+    let camel = data.get("todayCheckedIn");
+    let checked_in = match (snake, camel) {
+        (Some(a), _) if !a.is_boolean() => None,
+        (_, Some(b)) if !b.is_boolean() => None,
+        (a, b) => match (a.and_then(Value::as_bool), b.and_then(Value::as_bool)) {
+            (Some(a), Some(b)) if a != b => None,
+            (Some(value), _) | (_, Some(value)) => Some(value),
+            _ => None,
+        },
+    };
+    let Some(checked_in) = checked_in else {
+        // A successful envelope with an unknown or conflicting status shape is
+        // not evidence that the account is ready to submit a check-in.
+        return Some(json!({"ok": false, "error": "无法确认今日签到状态", "raw": data}));
+    };
     Some(json!({
         "ok": true,
-        "todayCheckedIn": data.get("today_checked_in")
-            .or_else(|| data.get("todayCheckedIn"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        "todayCheckedIn": checked_in,
         "raw": data,
     }))
 }
@@ -295,12 +308,10 @@ pub async fn perform_checkin(account: &Value) -> Value {
 }
 
 fn decide_from_status(status: &Value) -> StatusDecision {
-    // 没有状态查询接口的档位允许直接提交一次 daily-checkin，而不是把账号判成失败
-    // 并让调度反复重试。安全性来自 daily-checkin 自身的幂等性——重复提交会返回
-    // 「已签到」，因此这里不可能产生重复签到；结果也不会被伪造成 success。
-    // 国际版当前在 `checkin_account` 入口即被跳过，此分支保留为防御。
+    // 国际版当前在 `checkin_account` 入口即被跳过；若调用链改变，
+    // 状态不支持仍必须拒绝提交。
     if status.get("statusUnsupported").and_then(Value::as_bool) == Some(true) {
-        return StatusDecision::Submit;
+        return StatusDecision::Error("该档位暂无签到状态接口".into());
     }
     if status.get("ok").and_then(Value::as_bool) != Some(true) {
         return StatusDecision::Error(
@@ -311,10 +322,10 @@ fn decide_from_status(status: &Value) -> StatusDecision {
                 .to_string(),
         );
     }
-    if status.get("todayCheckedIn").and_then(Value::as_bool) == Some(true) {
-        StatusDecision::Already
-    } else {
-        StatusDecision::Submit
+    match status.get("todayCheckedIn").and_then(Value::as_bool) {
+        Some(true) => StatusDecision::Already,
+        Some(false) => StatusDecision::Submit,
+        None => StatusDecision::Error("无法确认今日签到状态".into()),
     }
 }
 
@@ -1052,22 +1063,35 @@ mod tests {
         );
     }
 
-    /// 有意扩展：该档位没有状态接口时允许直接提交一次（daily-checkin 自身幂等）。
+    /// 缺少状态接口时不能据此推断今日尚未签到。
     #[test]
-    fn status_unsupported_variant_submits_once() {
+    fn status_unsupported_variant_does_not_submit() {
         assert_eq!(
             decide_from_status(&json!({
                 "ok": false,
                 "statusUnsupported": true,
                 "error": "该档位暂无签到状态接口"
             })),
-            StatusDecision::Submit
+            StatusDecision::Error("该档位暂无签到状态接口".to_string())
         );
         // 其它失败仍然不进提交流程。
         assert_eq!(
             decide_from_status(&json!({"ok": false, "statusUnsupported": false, "error": "x"})),
             StatusDecision::Error("x".to_string())
         );
+    }
+
+    #[test]
+    fn unknown_status_does_not_submit() {
+        for status in [
+            json!({"ok": true}),
+            json!({"ok": true, "todayCheckedIn": null}),
+        ] {
+            assert_eq!(
+                decide_from_status(&status),
+                StatusDecision::Error("无法确认今日签到状态".to_string())
+            );
+        }
     }
 
     #[test]
@@ -1175,6 +1199,24 @@ mod tests {
         }))
         .expect("camelCase 也应解析");
         assert_eq!(snake["todayCheckedIn"], false);
+    }
+
+    #[test]
+    fn malformed_success_status_is_not_treated_as_unsigned() {
+        for data in [
+            json!({}),
+            json!({"today_checked_in": "false"}),
+            json!({"today_checked_in": false, "todayCheckedIn": true}),
+            json!({"today_checked_in": false, "todayCheckedIn": null}),
+        ] {
+            let parsed = status_from_response(&json!({"code": 0, "data": data})).unwrap();
+            assert_eq!(parsed["ok"], false);
+            assert!(parsed.get("todayCheckedIn").is_none());
+            assert_eq!(
+                decide_from_status(&parsed),
+                StatusDecision::Error("无法确认今日签到状态".to_string())
+            );
+        }
     }
 
     #[test]
