@@ -6,7 +6,9 @@
 
 use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::modules::account::{
     account_display_name, build_auth_headers, envelope_token_error, variant_of,
@@ -18,6 +20,9 @@ use crate::modules::config::{
 use crate::modules::credit_usage;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 use crate::modules::variant::WbVariant;
+use crate::modules::{
+    account, account_repository::AccountRepository, credential_store::CapabilityType,
+};
 
 /// 旧资源接口路径后缀（按档位生成完整候选，见 `WbVariant::billing_paths`）。
 const USER_RESOURCE_SUFFIX: &str = "/get-user-resource";
@@ -25,6 +30,7 @@ const WORKBUDDY_WEB_ENDPOINT: &str = "https://www.workbuddy.cn";
 const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
 const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-free-packages";
+const VERIFIED_POINTS_HOST: &str = "www.codebuddy.cn/billing/meter";
 const PRODUCT_CODE: &str = "p_tcaca";
 const EXPIRING_SOON_DAYS: i64 = 7;
 /// DeductionEndTime 比 CycleEndTime 晚超过该天数时，视前者为长期占位
@@ -477,6 +483,9 @@ pub fn api_base_for(account: &Value) -> &'static str {
     if variant_of(account) == WbVariant::Ai {
         return WbVariant::Ai.api_endpoint();
     }
+    if account["capability_credentials"]["PointsRead"]["verified_for"] == VERIFIED_POINTS_HOST {
+        return WORKBUDDY_API_ENDPOINT;
+    }
     // 官网脚本使用相对路径，实际请求的是当前登录 origin。账号库中的 CN
     // OAuth token 默认签发给 www.codebuddy.cn；若把它固定发往
     // www.workbuddy.cn，令牌域和 X-Domain 会不一致并被网关拒绝。
@@ -640,7 +649,9 @@ fn normalized_new_resources(
     let summary_ok = is_success(summary_response) && has_resource_packages(summary_response);
     let paid_ok = is_success(paid_response) && has_resource_accounts(paid_response);
     let free_ok = is_success(free_response) && has_resource_accounts(free_response);
-    if !(summary_ok || paid_ok || free_ok) {
+    // A partial set cannot be presented as the account's total remaining
+    // balance. Let the legacy complete-resource fallback decide instead.
+    if !(summary_ok && paid_ok && free_ok) {
         return None;
     }
 
@@ -773,10 +784,11 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
         });
     }
 
-    if let Some(error) = crate::modules::account_repository::api_capability_error(
-        crate::modules::credential_store::CapabilityType::PointsRead,
-    ) {
-        return json!({"ok": false, "error": error, "reason": "authorization_unverified"});
+    if variant_of(account) != WbVariant::Cn
+        || account["capability_credentials"]["PointsRead"]["authorized"] != true
+        || account["capability_credentials"]["PointsRead"]["verified_for"] != VERIFIED_POINTS_HOST
+    {
+        return json!({"ok": false, "error": "该账号尚未验证积分查询授权", "reason": "authorization_unverified"});
     }
     let now = now_ms();
 
@@ -809,6 +821,87 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
         response = fetch_legacy_user_resource(&fallback_account).await;
     }
     legacy_credit_result(account, &response, now)
+}
+
+/// A user-triggered refresh may enroll one CN account after a bounded,
+/// read-only probe of the exact resource endpoint. Background refresh never
+/// creates a new purpose grant.
+pub async fn verify_and_enroll_account(account_id: &str) -> Result<(), String> {
+    let accounts = account::try_load_accounts().map_err(|_| "账号库无法读取".to_string())?;
+    let candidate = accounts
+        .iter()
+        .find(|item| item["id"] == account_id)
+        .ok_or_else(|| "账号不存在".to_string())?;
+    if variant_of(candidate) != WbVariant::Cn
+        || candidate["credential_locked"] == true
+        || candidate["needs_relogin"] == true
+    {
+        return Err("该账号不能用于国内版积分查询验证".into());
+    }
+    let uid = candidate["uid"]
+        .as_str()
+        .filter(|value| !value.is_empty() && value.is_ascii())
+        .ok_or_else(|| "账号身份缺失".to_string())?;
+    let token = candidate["access_token"]
+        .as_str()
+        .filter(|value| !value.is_empty() && value.is_ascii())
+        .ok_or_else(|| "账号积分查询凭证缺失".to_string())?;
+    if candidate["capability_credentials"]["PointsRead"]["authorized"] == true
+        && candidate["capability_credentials"]["PointsRead"]["verified_for"] == VERIFIED_POINTS_HOST
+    {
+        return Ok(());
+    }
+    let token_digest = Sha256::digest(token.as_bytes());
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| "积分查询客户端初始化失败".to_string())?;
+    let response = client
+        .post("https://www.codebuddy.cn/billing/meter/get-user-resource-summary")
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .header("X-User-Id", uid)
+        .header("User-Agent", "WorkBuddy")
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|_| "积分接口连接失败".to_string())?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err("积分接口未通过状态验证".into());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "积分接口响应无法读取".to_string())?;
+    if bytes.len() > 65_536 {
+        return Err("积分接口响应超出预期大小".into());
+    }
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|_| "积分接口响应无法解析".to_string())?;
+    if body["code"] != 0 || !body["data"]["Packages"].is_array() {
+        return Err("积分接口响应结构未通过验证".into());
+    }
+    AccountRepository::new(&crate::modules::config::accounts_file())
+        .update(|items| {
+            let current = items
+                .iter_mut()
+                .find(|item| item["id"] == account_id)
+                .ok_or_else(|| std::io::Error::other("账号验证期间发生变化"))?;
+            let current_token = current["access_token"].as_str().unwrap_or("");
+            if current["uid"] != uid || Sha256::digest(current_token.as_bytes()) != token_digest {
+                return Err(std::io::Error::other("账号凭证在验证期间发生变化，请重试"));
+            }
+            current["capability_credentials"]["PointsRead"] = json!({
+                "authorized": true,
+                "verified_for": VERIFIED_POINTS_HOST,
+                "verified_at_ms": crate::modules::config::now_ms(),
+                "capability_type": CapabilityType::PointsRead.as_str(),
+            });
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
 }
 
 /// 单接口档位（国际版）的取数：旧接口自带完整鉴权链路。
@@ -1023,7 +1116,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_new_success_returns_available_resources() {
+    fn partial_new_success_does_not_claim_total_balance() {
         let resources = normalized_new_resources(
             &json!({"code": 500, "message": "summary failed"}),
             &json!({"code": 0, "data": {"Accounts": []}}),
@@ -1036,12 +1129,8 @@ mod tests {
                 }]}}
             }),
             1_800_000_000_000,
-        )
-        .expect("合法空 paid 和可用 free 明细应视为部分成功");
-
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0]["packageCode"], "free");
-        assert_eq!(resources[0]["remaining"], 75.0);
+        );
+        assert!(resources.is_none());
     }
 
     #[test]

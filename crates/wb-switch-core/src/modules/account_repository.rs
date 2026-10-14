@@ -313,7 +313,7 @@ impl AccountRepository {
 }
 
 /// Public capability summary is independent from whether a token is syntactically present.
-/// Checkin/PointsRead remain unverified until their dedicated adapter verifies scope.
+/// Purpose-specific grants are reported only after their dedicated adapter verifies scope.
 pub fn capabilities(account: &Value) -> Value {
     let status = if account["credential_locked"] == true {
         "CredentialUnavailable"
@@ -329,15 +329,24 @@ pub fn capabilities(account: &Value) -> Value {
     } else {
         "AvailableForDesktop"
     };
+    let points_grant = &account["capability_credentials"]["PointsRead"];
+    let points_status = if points_grant["authorized"] == true
+        && points_grant["verified_for"] == "www.codebuddy.cn/billing/meter"
+        && status == "AvailableForDesktop"
+    {
+        "Verified"
+    } else {
+        "Unverified"
+    };
     json!([
         {"capability_type": "DesktopSwitch", "authorization_status": status, "expires_at": account["expiresAt"], "last_verified_at": null},
         {"capability_type": "Checkin", "authorization_status": "Unverified", "expires_at": null, "last_verified_at": null},
-        {"capability_type": "PointsRead", "authorization_status": "Unverified", "expires_at": null, "last_verified_at": null},
+        {"capability_type": "PointsRead", "authorization_status": points_status, "expires_at": account["expiresAt"], "last_verified_at": points_grant["verified_at_ms"]},
     ])
 }
 
-/// Production API capabilities are closed until their issuer/audience/scope
-/// verification has an audited implementation. Presence of a token is not proof.
+/// Legacy global API entrypoints remain closed. PointsRead uses a separate
+/// per-account grant in credits.rs; presence of a token alone is not proof.
 pub fn api_capability_error(capability: CapabilityType) -> Option<&'static str> {
     match capability {
         CapabilityType::DesktopSwitch => None,

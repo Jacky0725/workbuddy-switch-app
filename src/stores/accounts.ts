@@ -27,9 +27,9 @@ function fetchStatus(variant: WbVariant): Promise<AppStatus> {
   return statusInflight.promise;
 }
 
-async function fetchCreditExpiry(id: string): Promise<CreditExpiry> {
+async function fetchCreditExpiry(id: string, enroll: boolean): Promise<CreditExpiry> {
   try {
-    return await api.getCreditExpiry(id);
+    return await api.getCreditExpiry(id, enroll);
   } catch (e) {
     return { ok: false, error: api.asError(e) };
   }
@@ -199,7 +199,7 @@ async function loadCredits(accountIds: string[], force: boolean, silent: boolean
 
   await Promise.all(
     toFetch.map(async (id) => {
-      const result = await fetchCreditExpiry(id);
+      const result = await fetchCreditExpiry(id, force && !silent);
       creditInflight.delete(id);
       useAccountsStore.setState((s) => ({
         creditMap: { ...s.creditMap, [id]: result },

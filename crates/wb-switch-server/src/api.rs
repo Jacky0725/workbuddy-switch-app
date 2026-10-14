@@ -1365,6 +1365,13 @@ fn checkin_status_item(account: &Value, mut status: Value) -> Value {
 
 async fn api_credits(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
+    if body.get("enroll") == Some(&Value::Bool(true)) {
+        if let Err(error) = credits::verify_and_enroll_account(id).await {
+            return json_ok(
+                json!({ "ok": false, "error": error, "reason": "authorization_unverified" }),
+            );
+        }
+    }
     let Some(acc) = account::find_account(id) else {
         return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };

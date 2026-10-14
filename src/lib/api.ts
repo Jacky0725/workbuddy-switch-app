@@ -846,8 +846,8 @@ export async function getCheckinStatus(accountId: string): Promise<{
   return call("get_checkin_status", { accountId });
 }
 
-export function getCreditExpiry(accountId: string): Promise<CreditExpiry> {
-  return call("get_credit_expiry", { accountId });
+export function getCreditExpiry(accountId: string, enroll = false): Promise<CreditExpiry> {
+  return call("get_credit_expiry", { accountId, enroll });
 }
 
 export function getCreditStatistics(refresh = false): Promise<CreditStatistics> {

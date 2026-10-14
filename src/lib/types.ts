@@ -42,7 +42,7 @@ export interface AccountMeta {
 
 export interface AccountCapability {
   capability_type: "DesktopSwitch" | "Checkin" | "PointsRead";
-  authorization_status: "AvailableForDesktop" | "NeedsAuthorization" | "Expired" | "CredentialUnavailable" | "Unverified";
+  authorization_status: "AvailableForDesktop" | "NeedsAuthorization" | "Expired" | "CredentialUnavailable" | "Unverified" | "Verified";
   expires_at: number | null;
   last_verified_at: number | null;
 }

@@ -287,6 +287,23 @@ fn expired_credentials_require_authorization_and_api_capabilities_remain_unverif
 }
 
 #[test]
+fn points_capability_requires_verified_host_and_available_desktop_credential() {
+    let mut entry = record("a", "cn");
+    entry["capability_credentials"]["PointsRead"] = json!({
+        "authorized": true,
+        "verified_for": "www.codebuddy.cn/billing/meter",
+        "verified_at_ms": 123,
+    });
+    assert_eq!(capabilities(&entry)[2]["authorization_status"], "Verified");
+    assert_eq!(capabilities(&entry)[2]["last_verified_at"], 123);
+    entry["capability_credentials"]["PointsRead"]["verified_for"] = json!("example.invalid");
+    assert_eq!(
+        capabilities(&entry)[2]["authorization_status"],
+        "Unverified"
+    );
+}
+
+#[test]
 fn failed_credential_write_preserves_original_account_index() {
     let f = Fixture::new();
     let original = serde_json::to_string(&vec![record("a", "cn")]).unwrap();

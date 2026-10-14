@@ -1013,7 +1013,14 @@ pub async fn get_checkin_status(account_id: String) -> Result<Value, String> {
 
 /// POST /api/credits —— 查询单账号积分资源及到期时间。
 #[tauri::command]
-pub async fn get_credit_expiry(account_id: String) -> Result<Value, String> {
+pub async fn get_credit_expiry(account_id: String, enroll: bool) -> Result<Value, String> {
+    if enroll {
+        if let Err(error) = credits::verify_and_enroll_account(&account_id).await {
+            return Ok(
+                json!({ "ok": false, "error": error, "reason": "authorization_unverified" }),
+            );
+        }
+    }
     let acc = account::find_account(&account_id).ok_or("账号不存在")?;
     Ok(credits::get_credit_expiry(&acc).await)
 }
