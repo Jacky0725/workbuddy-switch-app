@@ -1,4 +1,4 @@
-//! Exact local-client profile for a limited CN candidate; other session kinds stay closed.
+//! Exact local-client profiles for a limited CN candidate; other session kinds stay closed.
 use crate::modules::{process, session::SessionPaths, session_link, variant::WbVariant};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -16,14 +16,16 @@ pub fn require_verified_client() -> Result<(), String> {
 
 // This is a deliberately narrow, local-only compatibility profile. Any client
 // update or schema change closes the write path until it is checked again.
-const VERIFIED_CN_EXE_SHA256: &str =
-    "b2877bdde11794652c93dc81625ef3ae6befa77a321463039e101956e470de22";
+const VERIFIED_CN_EXE_SHA256: &[&str] = &[
+    "b2877bdde11794652c93dc81625ef3ae6befa77a321463039e101956e470de22", // 5.8.1
+    "ffbcf6d43caed2868ce876948bf63e78fa244109282681fb6a1f9f534d717552", // 5.8.2
+];
 const VERIFIED_CN_SESSION_SCHEMA_SHA256: &str =
     "58f169b7f8ae860d7dd7c31424ae2e43d3a2980b79df5ddff40bc5d2f9a3b5ae";
 const VERIFIED_CN_EDGE_SCHEMA_SHA256: &str =
     "5abcbbd5319851cd637d7e08002f546dd4041d08edc00b33d4a3dc99d9f060fd";
 
-/// Matches only the observed WorkBuddy CN 5.8.1 local-session candidate.
+/// Matches only the observed WorkBuddy CN 5.8.1/5.8.2 local-session candidates.
 /// This structural check is not a completed live write/read acceptance test.
 /// Row and body checks still reject unsupported references.
 pub fn require_verified_local_client(variant: WbVariant) -> Result<(), String> {
@@ -38,8 +40,8 @@ pub fn require_verified_local_client(variant: WbVariant) -> Result<(), String> {
     {
         let exe = process::windows_workbuddy_exe_path(variant)
             .ok_or_else(|| UNVERIFIED_CLIENT.to_string())?;
-        if file_digest(&exe)? != VERIFIED_CN_EXE_SHA256 {
-            return Err("WorkBuddy 客户端版本与已验证的 5.8.1 不同，已停止会话写入".into());
+        if !VERIFIED_CN_EXE_SHA256.contains(&file_digest(&exe)?.as_str()) {
+            return Err("WorkBuddy 客户端版本未通过会话写入验证，已停止写入".into());
         }
         let paths = SessionPaths::for_variant(variant);
         let main = open_readonly(&paths.workbuddy_db())?;
