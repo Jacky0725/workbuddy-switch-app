@@ -602,7 +602,9 @@ fn insert_session_copy(
         let value = match col.as_str() {
             "id" => rusqlite::types::Value::Text(new_cid.to_string()),
             "user_id" => rusqlite::types::Value::Text(target_uid.to_string()),
-            "created_at" | "updated_at" => rusqlite::types::Value::Integer(now_ms()),
+            "created_at" | "updated_at" | "last_activity_at" => {
+                rusqlite::types::Value::Integer(now_ms())
+            }
             "deleted_at" => rusqlite::types::Value::Null,
             _ => value,
         };
@@ -4202,6 +4204,32 @@ mod tests {
         let report = copy(&env, "uid-c", &["sess-1"]);
         assert_eq!(report["errors"].as_array().unwrap().len(), 1);
         assert_eq!(env.body_files(), before);
+    }
+
+    #[test]
+    fn new_copy_has_recent_sidebar_activity_without_changing_source() {
+        let env = ready_env("copy-sidebar-activity");
+        let db = Connection::open(env.paths.workbuddy_db()).unwrap();
+        db.execute_batch("ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER; UPDATE sessions SET last_activity_at=1000 WHERE id='sess-1';").unwrap();
+        let started = now_ms();
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target = env.first_copy_id(&report);
+        let activity: i64 = db
+            .query_row(
+                "SELECT last_activity_at FROM sessions WHERE id=?1",
+                [&target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original: i64 = db
+            .query_row(
+                "SELECT last_activity_at FROM sessions WHERE id='sess-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(activity >= started);
+        assert_eq!(original, 1000);
     }
 
     #[test]
