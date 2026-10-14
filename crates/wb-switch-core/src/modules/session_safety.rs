@@ -165,20 +165,13 @@ pub(crate) fn validate_local_transfer_kind(
     Ok(())
 }
 
-/// The current copy/sync algorithm moves one JSONL file, not files referenced
-/// by that JSONL. Refuse records with known external resources before writing.
-pub(crate) fn validate_self_contained_body(text: &str) -> Result<(), String> {
+/// Checkpoint files are handled separately by session_resources. Other external
+/// references still require their own migration rules before writes are allowed.
+pub(crate) fn validate_transfer_body(text: &str) -> Result<(), String> {
+    crate::modules::session_resources::names(text)?;
     for line in text.lines() {
         let record: serde_json::Value =
             serde_json::from_str(line).map_err(|_| "会话正文无法解析，已停止写入".to_string())?;
-        if record.get("type").and_then(serde_json::Value::as_str) == Some("file-history-snapshot")
-            && record
-                .get("snapshot")
-                .and_then(|snapshot| snapshot.get("trackedFileBackups"))
-                .is_some_and(nonempty_reference)
-        {
-            return Err("会话含文件历史备份引用，当前无法完整迁移，已停止写入".into());
-        }
         if has_attachment_reference(&record) {
             return Err("会话含附件或外部文件引用，当前无法完整迁移，已停止写入".into());
         }
@@ -359,14 +352,13 @@ mod compatibility_profile_tests {
 
     #[test]
     fn external_resource_references_are_rejected_before_write() {
-        assert!(validate_self_contained_body(r#"{"type":"message","content":"test"}"#).is_ok());
-        assert!(validate_self_contained_body(
+        assert!(validate_transfer_body(r#"{"type":"message","content":"test"}"#).is_ok());
+        assert!(validate_transfer_body(
             r#"{"type":"file-history-snapshot","snapshot":{"trackedFileBackups":{"a":"b"}}}"#
         )
         .is_err());
-        assert!(validate_self_contained_body(
-            r#"{"type":"message","attachments":[{"id":"asset"}]}"#
-        )
-        .is_err());
+        assert!(
+            validate_transfer_body(r#"{"type":"message","attachments":[{"id":"asset"}]}"#).is_err()
+        );
     }
 }

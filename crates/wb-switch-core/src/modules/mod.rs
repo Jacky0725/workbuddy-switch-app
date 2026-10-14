@@ -34,6 +34,7 @@ pub mod session_backup;
 pub mod session_groups;
 pub mod session_link;
 pub mod session_safety;
+pub(crate) mod session_resources;
 pub mod switch;
 pub mod token_stats;
 pub mod travel;

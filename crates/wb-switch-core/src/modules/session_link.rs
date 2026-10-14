@@ -1303,6 +1303,8 @@ pub struct PreviewMemberBinding {
     pub session_id: String,
     /// 原始正文摘要（含空白）：预览之后正文有任何改动都会失配。
     pub raw_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_digest: Option<String>,
     /// 归一化总摘要：判定的依据。
     pub normalized_digest: String,
     /// 记录数（不称消息数）。
@@ -3092,6 +3094,7 @@ mod tests {
                 uid: "uid-a".to_string(),
                 session_id: "sess-1".to_string(),
                 raw_digest: "raw-a".to_string(),
+                resource_digest: None,
                 normalized_digest: "norm-a".to_string(),
                 record_count: 3,
             },
@@ -3101,6 +3104,7 @@ mod tests {
                 uid: "uid-b".to_string(),
                 session_id: "sess-b".to_string(),
                 raw_digest: "raw-b".to_string(),
+                resource_digest: None,
                 normalized_digest: "norm-b".to_string(),
                 record_count: 2,
             },

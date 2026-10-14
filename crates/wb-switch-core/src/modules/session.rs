@@ -1080,10 +1080,7 @@ struct TargetResolution {
 
 /// 目标账号在关联组内的 active 成员是否真实有效：正文可验证 + 会话行归属正确。
 fn member_is_valid(paths: &SessionPaths, member: &LinkMember) -> bool {
-    let Some(body) = find_project_jsonl(paths, &member.session_id) else {
-        return false;
-    };
-    match session_link::read_content_snapshot(&body, &member.session_id) {
+    match member_content_state(paths, &member.session_id) {
         ContentState::Ready(_) => {}
         ContentState::Missing | ContentState::Unavailable(_) => return false,
     }
@@ -1176,6 +1173,9 @@ fn write_copy_body(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("目标工作区目录创建失败：{error}"))?;
     }
+    crate::modules::session_safety::validate_transfer_body(&snapshot.text)?;
+    let history = crate::modules::session_resources::snapshot(source_paths, cid, &snapshot.text)?;
+    crate::modules::session_resources::install(target_paths, new_cid, &history)?;
     let text = snapshot.text.replace(cid, new_cid);
     // 正文属于业务完成门禁：会话专用持久化写（sync_all + 父目录持久化）。
     session_backup::durable_write_str(&dest, &text)
@@ -1240,7 +1240,8 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
             return Err(format!("会话内容无法验证（{reason}），未复制"));
         }
     };
-    crate::modules::session_safety::validate_self_contained_body(&snapshot.text)?;
+    crate::modules::session_safety::validate_transfer_body(&snapshot.text)?;
+    crate::modules::session_resources::snapshot(context.source_paths, cid, &snapshot.text)?;
     let source_owner = session_row_owner(context.source_paths, cid);
     match source_owner.as_deref() {
         Some(owner) if owner == context.source_uid => {}
@@ -1721,7 +1722,15 @@ pub(crate) fn member_content_state(paths: &SessionPaths, session_id: &str) -> Co
     match find_project_jsonl(paths, session_id) {
         Some(path) => match session_link::read_content_snapshot(&path, session_id) {
             ContentState::Ready(snapshot) => {
-                match crate::modules::session_safety::validate_self_contained_body(&snapshot.text) {
+                match crate::modules::session_safety::validate_transfer_body(&snapshot.text)
+                    .and_then(|_| {
+                        crate::modules::session_resources::snapshot(
+                            paths,
+                            session_id,
+                            &snapshot.text,
+                        )
+                        .map(|_| ())
+                    }) {
                     Ok(()) => ContentState::Ready(snapshot),
                     Err(reason) => ContentState::Unavailable(reason),
                 }
@@ -1808,12 +1817,42 @@ fn member_binding(member: &LinkMember, content: &ContentState) -> PreviewMemberB
         uid: member.uid.clone(),
         session_id: member.session_id.clone(),
         raw_digest,
+        resource_digest: None,
         normalized_digest,
         record_count,
     }
 }
 
-/// 由实时状态组装预览绑定（预览与执行前核对共用同一份装配逻辑）。
+#[allow(clippy::too_many_arguments)]
+fn bind_history_resources(
+    binding: &mut PreviewBinding,
+    source_paths: &SessionPaths,
+    source: &LinkMember,
+    source_content: &ContentState,
+    target_paths: &SessionPaths,
+    target: &LinkMember,
+    target_content: &ContentState,
+) -> Result<(), String> {
+    if let ContentState::Ready(content) = source_content {
+        binding.source.resource_digest = crate::modules::session_resources::snapshot(
+            source_paths,
+            &source.session_id,
+            &content.text,
+        )?
+        .identity();
+    }
+    if let ContentState::Ready(content) = target_content {
+        binding.target.resource_digest = crate::modules::session_resources::snapshot(
+            target_paths,
+            &target.session_id,
+            &content.text,
+        )?
+        .identity();
+    }
+    Ok(())
+}
+
+/// 由实时状态组装预览绑定（预览与执行前核对共用一份装配逻辑）。
 fn live_preview_binding(
     group: &LinkGroup,
     source_member: &LinkMember,
@@ -2111,7 +2150,7 @@ fn preview_group_item(
         "target": target_summary,
     });
     if actionable {
-        let binding = live_preview_binding(
+        let mut binding = live_preview_binding(
             group,
             source_member,
             target_member,
@@ -2120,6 +2159,20 @@ fn preview_group_item(
             &baseline,
             decision.verdict,
         );
+        if let Err(error) = bind_history_resources(
+            &mut binding,
+            &source_paths,
+            source_member,
+            &source_content,
+            &target_paths,
+            target_member,
+            &target_content,
+        ) {
+            item["availableModes"] = json!([]);
+            item["reason"] = json!(error);
+            item["defaultChecked"] = json!(false);
+            return item;
+        }
         match session_link::save_preview_token(store_paths, binding) {
             Ok(preview_id) => item["previewToken"] = json!(preview_id),
             Err(error) => {
@@ -2145,6 +2198,7 @@ struct SyncWritePlan {
     target_member: LinkMember,
     source_snapshot: ContentSnapshot,
     target_snapshot: ContentSnapshot,
+    history_resources: crate::modules::session_resources::HistoryBundle,
     /// 待写入目标的新正文：来源正文按本副本 sessionId 替换为目标 sessionId。
     incoming_text: String,
     /// 待写入正文的归一化内容（执行后据此复算摘要核验）。
@@ -2250,7 +2304,7 @@ fn plan_sync_selection(
         &target_member.member_id,
     );
     let decision = session_link::decide_sync(&source_content, &target_content, &baseline);
-    let live = live_preview_binding(
+    let mut live = live_preview_binding(
         group,
         source_member,
         target_member,
@@ -2259,6 +2313,17 @@ fn plan_sync_selection(
         &baseline,
         decision.verdict,
     );
+    if let Err(message) = bind_history_resources(
+        &mut live,
+        source_paths,
+        source_member,
+        &source_content,
+        paths,
+        target_member,
+        &target_content,
+    ) {
+        return SyncItemOutcome::Rejected { message };
+    }
     let mismatches = session_link::verify_preview(&token, &live);
     if !mismatches.is_empty() {
         return skip(format!("检查结果已失效：{}", mismatches.join("；")));
@@ -2291,6 +2356,17 @@ fn plan_sync_selection(
             }
         }
     };
+    let history_resources = match crate::modules::session_resources::snapshot(
+        source_paths,
+        &source_member.session_id,
+        &source_snapshot.text,
+    ) {
+        Ok(resources) => resources,
+        Err(message) => return SyncItemOutcome::Rejected { message },
+    };
+    if history_resources.identity() != live.source.resource_digest {
+        return skip("文件历史资源已变化，请重新检查".into());
+    }
     SyncItemOutcome::Validated {
         mode: selection.mode,
         verdict: decision.verdict,
@@ -2302,6 +2378,7 @@ fn plan_sync_selection(
             target_member: target_member.clone(),
             source_snapshot: source_snapshot.clone(),
             target_snapshot: target_snapshot.clone(),
+            history_resources,
             incoming_text,
             incoming,
             old_baseline_ref: live.baseline_ref,
@@ -2759,6 +2836,8 @@ struct SyncBackupManifest {
     mode: SyncMode,
     verdict: SyncVerdict,
     created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_digest: Option<String>,
     /// 目标正文的绝对路径（恢复补写用；使用时必须校验落在本项目录内）。
     target_body_path: String,
     source: SyncBackupMember,
@@ -3005,6 +3084,7 @@ fn create_sync_backup(
     // 3) 数据库一致性快照。
     let db_rel = "workbuddy.db".to_string();
     snapshot_workbuddy_db(&paths.workbuddy_db(), &dir.join(&db_rel))?;
+    crate::modules::session_resources::save(&dir, &plan.history_resources)?;
 
     let manifest = SyncBackupManifest {
         version: SYNC_BACKUP_VERSION,
@@ -3014,6 +3094,7 @@ fn create_sync_backup(
         mode: plan.mode,
         verdict: plan.verdict,
         created_at: now_ms(),
+        history_digest: plan.history_resources.identity(),
         target_body_path: target_body_path.to_string_lossy().to_string(),
         source: SyncBackupMember {
             member_id: plan.source_member.member_id.clone(),
@@ -3147,6 +3228,11 @@ fn apply_sync_body(
     }
     let text =
         String::from_utf8(bytes).map_err(|_| "待保存内容不是合法 UTF-8，未保存".to_string())?;
+    let resources = crate::modules::session_resources::load(backup_dir, &text)?;
+    if resources.identity() != manifest.history_digest {
+        return Err("文件历史资源与同步备份摘要不一致，已停止保存".into());
+    }
+    crate::modules::session_resources::install(paths, &manifest.target.session_id, &resources)?;
     write_sync_body(
         &target_body_path,
         &manifest.target.session_id,
@@ -3341,6 +3427,21 @@ fn run_sync_phases(
                 ContentState::Ready(content)
                     if content.normalized.total_digest == operation.expected_content_digest =>
                 {
+                    let resources =
+                        crate::modules::session_resources::load(backup_dir, &content.text)?;
+                    if resources.identity() != manifest.history_digest {
+                        return Err("文件历史资源与同步备份摘要不一致，已停止恢复".into());
+                    }
+                    crate::modules::session_resources::install(
+                        paths,
+                        &manifest.target.session_id,
+                        &resources,
+                    )?;
+                    crate::modules::session_resources::snapshot(
+                        paths,
+                        &manifest.target.session_id,
+                        &content.text,
+                    )?;
                     content.normalized
                 }
                 ContentState::Ready(_) => {
@@ -3416,6 +3517,11 @@ fn execute_sync_item(
         .ok_or_else(|| "目标内容不存在，未同步".to_string())?;
     crate::modules::session_safety::preflight_target_database(paths)?;
     crate::modules::session_safety::validate_body_path(paths, &target_body_path)?;
+    crate::modules::session_resources::preflight_install(
+        paths,
+        &plan.target_member.session_id,
+        &plan.history_resources,
+    )?;
     let new_updated_at = now_ms();
     let last_synced_at = now_ms();
     let new_baseline_ref = uuid::Uuid::new_v4().to_string();
@@ -3858,7 +3964,41 @@ fn recover_copy_operation(
 
     // 1) 目标正文：已写成则直接复用；未写成则用当前源内容补写；被改动则停止。
     let normalized = match check_target_body(paths, &operation) {
-        BodyCheck::Verified(normalized) => normalized,
+        BodyCheck::Verified(normalized) => {
+            let Some(path) = find_project_jsonl(paths, &operation.target.session_id) else {
+                return needs("目标正文缺失".into(), false);
+            };
+            let Ok(text) = std::fs::read_to_string(path) else {
+                return needs("目标正文无法读取".into(), false);
+            };
+            if let Err(error) = crate::modules::session_safety::validate_transfer_body(&text) {
+                return needs(error, false);
+            }
+            if crate::modules::session_resources::snapshot(
+                paths,
+                &operation.target.session_id,
+                &text,
+            )
+            .is_err()
+            {
+                let result = crate::modules::session_resources::snapshot(
+                    read_paths,
+                    &operation.source.session_id,
+                    &text,
+                )
+                .and_then(|bundle| {
+                    crate::modules::session_resources::install(
+                        paths,
+                        &operation.target.session_id,
+                        &bundle,
+                    )
+                });
+                if let Err(error) = result {
+                    return needs(error, false);
+                }
+            }
+            normalized
+        }
         BodyCheck::NeedsRecovery(reason) => return needs(reason, false),
         BodyCheck::Absent => {
             let Some(source_path) = find_project_jsonl(read_paths, &operation.source.session_id)
@@ -4016,6 +4156,149 @@ mod tests {
     use super::*;
     use crate::modules::session_link::{LinkStore, MemberState, Operation, StoreState};
     use serde_json::json;
+
+    fn add_history(env: &Env, sid: &str, name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = env.paths.data_root.join("file-history").join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(name);
+        std::fs::write(&file, bytes).unwrap();
+        let body = env.body_path(sid);
+        let mut text = std::fs::read_to_string(&body).unwrap();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&json!({"type":"file-history-snapshot", "sessionId":sid,
+            "snapshot":{"trackedFileBackups":{"fiction.txt":{"backupFileName":name,"version":1,"existedAtTrack":true}}}}).to_string());
+        text.push('\n');
+        std::fs::write(body, text).unwrap();
+        file
+    }
+
+    #[test]
+    fn history_copy_preserves_referenced_bytes_and_rejects_missing_files() {
+        let env = ready_env("history-copy");
+        let source = add_history(&env, "sess-1", "abc@v1", b"fictional old file");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert!(
+            report["errors"]
+                .as_array()
+                .is_none_or(|errors| errors.is_empty()),
+            "{report}"
+        );
+        let target = env.first_copy_id(&report);
+        assert_eq!(
+            std::fs::read(
+                env.paths
+                    .data_root
+                    .join("file-history")
+                    .join(&target)
+                    .join("abc@v1")
+            )
+            .unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        std::fs::remove_file(source).unwrap();
+        let before = env.body_files();
+        let report = copy(&env, "uid-c", &["sess-1"]);
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(env.body_files(), before);
+    }
+
+    #[test]
+    fn history_resource_change_invalidates_sync_preview() {
+        let env = ready_env("history-preview");
+        let source = add_history(&env, "sess-1", "abc@v1", b"original");
+        let copied = copy(&env, "uid-b", &["sess-1"]);
+        let target = env.first_copy_id(&copied);
+        append_records(&env.body_path("sess-1"), "sess-1", 10, 1);
+        let p = preview(&env, "uid-b");
+        let g = &p["groups"][0];
+        let before = body_bytes(&env, &target);
+        std::fs::write(source, b"changed outside client").unwrap();
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(
+                g["groupId"].as_str().unwrap(),
+                g["previewToken"].as_str().unwrap(),
+                SyncMode::FastForward,
+            )],
+        );
+        assert_eq!(report["skipped"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(body_bytes(&env, &target), before);
+    }
+
+    #[test]
+    fn history_sync_recovers_from_saved_resources_after_source_disappears() {
+        let env = ready_env("history-recovery");
+        let copied = copy(&env, "uid-b", &["sess-1"]);
+        let target = env.first_copy_id(&copied);
+        let source = add_history(&env, "sess-1", "abc@v1", b"fictional checkpoint");
+        let p = preview(&env, "uid-b");
+        let g = &p["groups"][0];
+        install_block_update_trigger(&env);
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(
+                g["groupId"].as_str().unwrap(),
+                g["previewToken"].as_str().unwrap(),
+                SyncMode::FastForward,
+            )],
+        );
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(report["needsRecovery"], true);
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(
+            env.paths
+                .data_root
+                .join("file-history")
+                .join(&target)
+                .join("abc@v1"),
+        )
+        .unwrap();
+        drop_block_update_trigger(&env);
+        let recovered = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert!(recovered.is_clean(), "{recovered:?}");
+        assert_eq!(
+            std::fs::read(
+                env.paths
+                    .data_root
+                    .join("file-history")
+                    .join(&target)
+                    .join("abc@v1")
+            )
+            .unwrap(),
+            b"fictional checkpoint"
+        );
+    }
+
+    #[test]
+    fn history_sync_conflict_does_not_overwrite_existing_resource_or_body() {
+        let env = ready_env("history-conflict");
+        let copied = copy(&env, "uid-b", &["sess-1"]);
+        let target = env.first_copy_id(&copied);
+        add_history(&env, "sess-1", "abc@v1", b"source bytes");
+        let dir = env.paths.data_root.join("file-history").join(&target);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("abc@v1"), b"target bytes").unwrap();
+        let before = body_bytes(&env, &target);
+        let p = preview(&env, "uid-b");
+        let g = &p["groups"][0];
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(
+                g["groupId"].as_str().unwrap(),
+                g["previewToken"].as_str().unwrap(),
+                SyncMode::FastForward,
+            )],
+        );
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(body_bytes(&env, &target), before);
+        assert_eq!(std::fs::read(dir.join("abc@v1")).unwrap(), b"target bytes");
+        assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+    }
 
     struct Env {
         root: PathBuf,

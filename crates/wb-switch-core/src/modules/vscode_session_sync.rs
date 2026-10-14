@@ -627,6 +627,7 @@ fn member_binding(member: &LinkMember, content: &ContentState) -> PreviewMemberB
         uid: member.uid.clone(),
         session_id: member.session_id.clone(),
         raw_digest,
+        resource_digest: None,
         normalized_digest,
         record_count,
     }
