@@ -161,21 +161,27 @@ pub fn snapshot_at(root: &Path, now: i64) -> Result<SchedulerSnapshot, String> {
         .map_err(|_| "调度记录损坏或无法读取，请保留原文件".to_string())?;
     let (date, planned) = daily_scheduler::schedule(now, hour, minute)
         .map_err(|_| "系统时间无法用于调度".to_string())?;
-    let production = (root == config::store_dir()).then(production_accounts).and_then(Result::ok);
+    let production = (root == config::store_dir())
+        .then(production_accounts)
+        .and_then(Result::ok);
     let completed_today = production.as_ref().is_some_and(|(_, accounts)| {
-        let eligible = accounts.iter().filter(|account| {
-            account.enabled && config.account_enabled.get(&account.id) != Some(&false)
-        }).collect::<Vec<_>>();
-        !eligible.is_empty() && eligible.iter().all(|account| {
-            journal.tasks.values().any(|task| {
-                task.account_id == account.id
-                    && task.business_date == date
-                    && matches!(task.state, TaskState::Finished(
+        let eligible = accounts
+            .iter()
+            .filter(|account| {
+                account.enabled && config.account_enabled.get(&account.id) != Some(&false)
+            })
+            .collect::<Vec<_>>();
+        !eligible.is_empty()
+            && eligible.iter().all(|account| {
+                journal.tasks.values().any(|task| {
+                    task.account_id == account.id
+                        && task.business_date == date
+                        && matches!(task.state, TaskState::Finished(
                         crate::modules::checkin_service::CheckinResultStatus::Success
                         | crate::modules::checkin_service::CheckinResultStatus::AlreadyCompleted
                     ))
+                })
             })
-        })
     });
     let next = if now < planned {
         planned
@@ -318,6 +324,7 @@ pub async fn background_loop() {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
+        super::growth_schedule::dispatch();
         if background_tick_at(&config::store_dir(), config::now_ms())
             .await
             .is_err()

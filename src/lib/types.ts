@@ -422,6 +422,22 @@ export interface ManagerSchedulerConfig {
   catch_up: boolean; max_daily_attempts: number; retry_delay_seconds: number;
   account_enabled: Record<string, boolean>;
 }
+export interface GrowthTask {
+  code: string; title: string; accept_status: string; locked: boolean | null;
+  current: number | null; target: number | null; reward_credit: number | null; reward_energy: number | null;
+  valid_start_ms: number | null; valid_end_ms: number | null; progress_complete: boolean;
+}
+export interface GrowthAccount {
+  account_id: string; observed_at_ms: number | null; stale: boolean; error: string | null; tasks: GrowthTask[];
+}
+export interface GrowthSnapshot {
+  accounts: GrowthAccount[]; automatic_execution_enabled: boolean; execution_status: string;
+}
+export interface GrowthRunReport { verified: number; already_claimed: number; awaiting_verification: number; skipped: number; waiting:number; halted:boolean; errors: string[]; }
+export interface GrowthConfig { version: number; enabled: boolean; auto_claim: boolean; account_ids: string[]; daily_time: string; travel_claim:boolean; travel_depart:boolean; travel_location_id:number|null; }
+export interface GrowthTravel { state:{account_id:string;state:"idle"|"traveling"|"arrived";daily_limit_reached:boolean;record_id:number|null;location_id:number|null;depart_at:number|null;arrive_at:number|null}; enabled:boolean; locations:{id:number;name:string}[]; }
+export interface GrowthSchedule { config: GrowthConfig; revision: string; running: boolean; state: { date: string; last_started_ms: number | null; finished_ms: number | null; next_retry_ms: number | null; error: string | null; }; }
+export interface GrowthOperation { operation_id: string; account_id: string; task_code: string; state: "AwaitingVerification" | "Verified"; submitted_at_ms: number; verified_at_ms: number | null; error: string | null; }
 export type ManagerTaskStatus = "Success" | "AlreadyCompleted" | "AuthExpired" | "RequiresUserAction" | "RateLimited" | "NetworkError" | "ServerError" | "Unsupported" | "Unknown" | "Cancelled" | "InProgress";
 export interface ManagerDailyTask {
   account_id: string; provider: string; region: WbVariant; business_date: string; scheduled_at_ms: number;

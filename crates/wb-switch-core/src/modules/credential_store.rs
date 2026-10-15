@@ -12,15 +12,28 @@ pub enum CapabilityType {
     DesktopSwitch,
     Checkin,
     PointsRead,
+    GrowthRead,
+    GrowthClaim,
+    GrowthTravel,
 }
 
 impl CapabilityType {
-    pub const ALL: [Self; 3] = [Self::DesktopSwitch, Self::Checkin, Self::PointsRead];
+    pub const ALL: [Self; 6] = [
+        Self::DesktopSwitch,
+        Self::Checkin,
+        Self::PointsRead,
+        Self::GrowthRead,
+        Self::GrowthClaim,
+        Self::GrowthTravel,
+    ];
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DesktopSwitch => "DesktopSwitch",
             Self::Checkin => "Checkin",
             Self::PointsRead => "PointsRead",
+            Self::GrowthRead => "GrowthRead",
+            Self::GrowthClaim => "GrowthClaim",
+            Self::GrowthTravel => "GrowthTravel",
         }
     }
 }

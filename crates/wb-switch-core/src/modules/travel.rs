@@ -133,7 +133,7 @@ fn resp_error(resp: &Value, fallback_code: i64) -> String {
         .unwrap_or_else(|| format!("code={fallback_code}"))
 }
 
-fn parse_travel_state(raw: Option<&str>) -> Option<&'static str> {
+pub(crate) fn parse_travel_state(raw: Option<&str>) -> Option<&'static str> {
     let normalized = raw.map(|s| s.trim().to_ascii_lowercase())?;
     KNOWN_STATES
         .iter()

@@ -352,5 +352,8 @@ pub fn api_capability_error(capability: CapabilityType) -> Option<&'static str> 
         CapabilityType::DesktopSwitch => None,
         CapabilityType::Checkin => Some("签到授权边界尚未验证，真实接口已禁用"),
         CapabilityType::PointsRead => Some("积分查询授权边界尚未验证，真实接口已禁用"),
+        CapabilityType::GrowthRead => Some("请使用限定的成长任务查询入口"),
+        CapabilityType::GrowthClaim => Some("请使用限定的成长任务领取入口"),
+        CapabilityType::GrowthTravel => Some("请使用限定的成长旅行入口"),
     }
 }

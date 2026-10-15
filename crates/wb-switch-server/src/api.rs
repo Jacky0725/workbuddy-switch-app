@@ -1555,6 +1555,15 @@ fn manager_scheduler_routes(root: std::path::PathBuf) -> Router {
             Err(error) => json_err(error, StatusCode::BAD_REQUEST),
         }
     }
+    async fn growth_read(State(root): State<std::path::PathBuf>) -> Response {
+        if root != config::store_dir() {
+            return json_err("测试环境不读取真实成长任务".into(), StatusCode::FORBIDDEN);
+        }
+        match wb_switch_core::modules::growth::snapshot() {
+            Ok(snapshot) => Json(snapshot).into_response(),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        }
+    }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct SaveBody {
@@ -1571,6 +1580,44 @@ fn manager_scheduler_routes(root: std::path::PathBuf) -> Router {
     struct RunBody {
         account_id: Option<String>,
     }
+    async fn growth_refresh(
+        State(root): State<std::path::PathBuf>,
+        Json(body): Json<RunBody>,
+    ) -> Response {
+        if root != config::store_dir() {
+            return json_err("测试环境不查询真实成长任务".into(), StatusCode::FORBIDDEN);
+        }
+        match wb_switch_core::modules::growth::refresh(body.account_id.as_deref()).await {
+            Ok(snapshot) => Json(snapshot).into_response(),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        }
+    }
+    async fn growth_schedule_read(State(root): State<std::path::PathBuf>) -> Response {
+        if root != config::store_dir() {
+            return json_err("测试环境不读取真实成长计划".into(), StatusCode::FORBIDDEN);
+        }
+        match wb_switch_core::modules::growth_schedule::snapshot() {
+            Ok(snapshot) => Json(snapshot).into_response(),
+            Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+        }
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GrowthSaveBody {
+        request: wb_switch_core::modules::growth_schedule::SaveRequest,
+    }
+    async fn growth_schedule_save(
+        State(root): State<std::path::PathBuf>,
+        Json(body): Json<GrowthSaveBody>,
+    ) -> Response {
+        if root != config::store_dir() {
+            return json_err("测试环境不修改真实成长计划".into(), StatusCode::FORBIDDEN);
+        }
+        match wb_switch_core::modules::growth_schedule::save(body.request) {
+            Ok(snapshot) => Json(snapshot).into_response(),
+            Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+        }
+    }
     async fn run(State(root): State<std::path::PathBuf>, Json(body): Json<RunBody>) -> Response {
         if root != config::store_dir() {
             return json_err(manager::BLOCKED_REASON.to_string(), StatusCode::FORBIDDEN);
@@ -1580,9 +1627,85 @@ fn manager_scheduler_routes(root: std::path::PathBuf) -> Router {
             Err(error) => json_err(error, StatusCode::FORBIDDEN),
         }
     }
+    async fn growth_claim(
+        State(root): State<std::path::PathBuf>,
+        Json(body): Json<RunBody>,
+    ) -> Response {
+        if root != config::store_dir() {
+            return json_err("测试环境不提交成长任务".into(), StatusCode::FORBIDDEN);
+        }
+        match wb_switch_core::modules::growth_automation::run_claims(body.account_id.as_deref())
+            .await
+        {
+            Ok(report) => Json(report).into_response(),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        }
+    }
+    async fn growth_operations(State(root): State<std::path::PathBuf>) -> Response {
+        if root != config::store_dir() {
+            return json_err("测试环境不读取真实活动记录".into(), StatusCode::FORBIDDEN);
+        }
+        match wb_switch_core::modules::growth_automation::operations() {
+            Ok(rows) => Json(rows).into_response(),
+            Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+        }
+    }
+    async fn growth_travel_read(
+        State(root): State<std::path::PathBuf>,
+        Json(body): Json<RunBody>,
+    ) -> Response {
+        if root != config::store_dir() {
+            return json_err("测试环境不查询真实旅行状态".into(), StatusCode::FORBIDDEN);
+        }
+        let Some(id) = body.account_id else {
+            return json_err("请选择账号".into(), StatusCode::BAD_REQUEST);
+        };
+        match wb_switch_core::modules::growth_travel::query(&id).await {
+            Ok(s) => Json(s).into_response(),
+            Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+        }
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct TravelRunBody {
+        account_id: String,
+        claim: bool,
+        depart_location_id: Option<i64>,
+    }
+    async fn growth_travel_run(
+        State(root): State<std::path::PathBuf>,
+        Json(body): Json<TravelRunBody>,
+    ) -> Response {
+        if root != config::store_dir() {
+            return json_err("测试环境不提交旅行操作".into(), StatusCode::FORBIDDEN);
+        }
+        match wb_switch_core::modules::growth_travel::run(
+            &body.account_id,
+            body.claim,
+            body.depart_location_id,
+        )
+        .await
+        {
+            Ok(s) => Json(s).into_response(),
+            Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+        }
+    }
     Router::new()
         .route("/api/manager/scheduler", get(read).post(save))
+        .route(
+            "/api/manager/growth/schedule",
+            get(growth_schedule_read).post(growth_schedule_save),
+        )
         .route("/api/manager/checkin", post(run))
+        .route("/api/manager/growth", get(growth_read))
+        .route("/api/manager/growth/refresh", post(growth_refresh))
+        .route("/api/manager/growth/claim", post(growth_claim))
+        .route("/api/manager/growth/operations", get(growth_operations))
+        .route(
+            "/api/manager/growth/travel/refresh",
+            post(growth_travel_read),
+        )
+        .route("/api/manager/growth/travel/run", post(growth_travel_run))
         .route_layer(middleware::from_fn(local_origin))
         .with_state(root)
 }
@@ -1823,6 +1946,77 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn growth_routes_cannot_touch_live_credentials_from_fixture_or_cross_origin() {
+        let fixture = ManagerFixture::new();
+        for (method, path, body) in [
+            ("GET", "/api/manager/growth", json!(null)),
+            (
+                "POST",
+                "/api/manager/growth/refresh",
+                json!({"accountId":"fictional"}),
+            ),
+            (
+                "POST",
+                "/api/manager/growth/claim",
+                json!({"accountId":"fictional"}),
+            ),
+            ("GET", "/api/manager/growth/operations", json!(null)),
+            ("GET", "/api/manager/growth/schedule", json!(null)),
+            (
+                "POST",
+                "/api/manager/growth/travel/refresh",
+                json!({"accountId":"fictional"}),
+            ),
+            (
+                "POST",
+                "/api/manager/growth/travel/run",
+                json!({"accountId":"fictional","claim":true}),
+            ),
+        ] {
+            assert_eq!(
+                manager_request(
+                    &fixture.0,
+                    method,
+                    path,
+                    "127.0.0.1:57890",
+                    None,
+                    body.clone()
+                )
+                .await
+                .0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                manager_request(
+                    &fixture.0,
+                    method,
+                    path,
+                    "127.0.0.1:57890",
+                    Some("https://example.com"),
+                    body
+                )
+                .await
+                .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            manager_request(
+                &fixture.0,
+                "GET",
+                "/api/manager/growth/claim",
+                "127.0.0.1:57890",
+                None,
+                json!(null)
+            )
+            .await
+            .0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        assert!(!fixture.0.exists());
     }
 
     #[tokio::test]

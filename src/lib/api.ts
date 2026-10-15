@@ -123,6 +123,14 @@ const ROUTES: Record<string, Route> = {
   restore_manager_backup: { method: "POST", path: "/api/manager/backups/restore" },
   get_manager_logs: { method: "GET", path: "/api/manager/logs" },
   get_manager_scheduler: { method: "GET", path: "/api/manager/scheduler" },
+  get_growth_tasks: { method: "GET", path: "/api/manager/growth" },
+  refresh_growth_tasks: { method: "POST", path: "/api/manager/growth/refresh" },
+  claim_growth_rewards: { method: "POST", path: "/api/manager/growth/claim" },
+  get_growth_operations: { method: "GET", path: "/api/manager/growth/operations" },
+  get_growth_schedule: { method: "GET", path: "/api/manager/growth/schedule" },
+  save_growth_schedule: { method: "POST", path: "/api/manager/growth/schedule" },
+  refresh_growth_travel: { method: "POST", path: "/api/manager/growth/travel/refresh" },
+  run_growth_travel: { method: "POST", path: "/api/manager/growth/travel/run" },
   save_manager_scheduler: { method: "POST", path: "/api/manager/scheduler" },
   run_manager_checkin: { method: "POST", path: "/api/manager/checkin" },
   get_status: { method: "GET", path: "/api/status" },
@@ -289,6 +297,14 @@ export function getAccounts(): Promise<{ accounts: AccountMeta[] }> {
 }
 
 export function getManagerScheduler(): Promise<ManagerSchedulerSnapshot> { return call("get_manager_scheduler"); }
+export function getGrowthTasks(): Promise<import("./types").GrowthSnapshot> { return call("get_growth_tasks"); }
+export function refreshGrowthTasks(accountId?: string): Promise<import("./types").GrowthSnapshot> { return call("refresh_growth_tasks", { accountId }); }
+export function claimGrowthRewards(accountId?: string): Promise<import("./types").GrowthRunReport> { return call("claim_growth_rewards", { accountId }); }
+export function getGrowthOperations(): Promise<import("./types").GrowthOperation[]> { return call("get_growth_operations"); }
+export function getGrowthSchedule(): Promise<import("./types").GrowthSchedule> { return call("get_growth_schedule"); }
+export function refreshGrowthTravel(accountId:string): Promise<import("./types").GrowthTravel> {return call("refresh_growth_travel",{accountId});}
+export function runGrowthTravel(accountId:string,claim:boolean,departLocationId?:number): Promise<import("./types").GrowthRunReport> {return call("run_growth_travel",{accountId,claim,departLocationId});}
+export function saveGrowthSchedule(config: import("./types").GrowthConfig, expectedRevision: string): Promise<import("./types").GrowthSchedule> { return call("save_growth_schedule", { request: { config, expected_revision: expectedRevision } }); }
 export function saveManagerScheduler(config: ManagerSchedulerConfig, expectedRevision: string): Promise<ManagerSchedulerSnapshot> {
   return call("save_manager_scheduler", { request: { config, expected_revision: expectedRevision } });
 }

@@ -1150,6 +1150,57 @@ pub fn get_manager_scheduler(
 }
 
 #[tauri::command]
+pub fn get_growth_tasks() -> Result<wb_switch_core::modules::growth::GrowthSnapshot, String> {
+    wb_switch_core::modules::growth::snapshot()
+}
+
+#[tauri::command]
+pub async fn refresh_growth_tasks(
+    account_id: Option<String>,
+) -> Result<wb_switch_core::modules::growth::GrowthSnapshot, String> {
+    wb_switch_core::modules::growth::refresh(account_id.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn claim_growth_rewards(
+    account_id: Option<String>,
+) -> Result<wb_switch_core::modules::growth_automation::RunReport, String> {
+    wb_switch_core::modules::growth_automation::run_claims(account_id.as_deref()).await
+}
+
+#[tauri::command]
+pub fn get_growth_operations(
+) -> Result<Vec<wb_switch_core::modules::growth_automation::ActivityOperation>, String> {
+    wb_switch_core::modules::growth_automation::operations()
+}
+
+#[tauri::command]
+pub fn get_growth_schedule(
+) -> Result<wb_switch_core::modules::growth_schedule::ScheduleSnapshot, String> {
+    wb_switch_core::modules::growth_schedule::snapshot()
+}
+#[tauri::command]
+pub async fn refresh_growth_travel(
+    account_id: String,
+) -> Result<wb_switch_core::modules::growth_travel::TravelSnapshot, String> {
+    wb_switch_core::modules::growth_travel::query(&account_id).await
+}
+#[tauri::command]
+pub async fn run_growth_travel(
+    account_id: String,
+    claim: bool,
+    depart_location_id: Option<i64>,
+) -> Result<wb_switch_core::modules::growth_automation::RunReport, String> {
+    wb_switch_core::modules::growth_travel::run(&account_id, claim, depart_location_id).await
+}
+#[tauri::command]
+pub fn save_growth_schedule(
+    request: wb_switch_core::modules::growth_schedule::SaveRequest,
+) -> Result<wb_switch_core::modules::growth_schedule::ScheduleSnapshot, String> {
+    wb_switch_core::modules::growth_schedule::save(request)
+}
+
+#[tauri::command]
 pub fn save_manager_scheduler(
     request: wb_switch_core::modules::manager_scheduler::SaveSchedulerRequest,
 ) -> Result<wb_switch_core::modules::manager_scheduler::SchedulerSnapshot, String> {

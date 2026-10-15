@@ -39,6 +39,7 @@ fn refresh_headers(account: &Value, refresh_token: &str) -> HashMap<String, Stri
 ///
 /// 刷新失败（refresh token 失效等）时给账号标记 needs_relogin，避免无限重试。
 pub async fn refresh_account_token(mut account: Value) -> Value {
+    let original = account.clone();
     let previous_access_token = account
         .get("access_token")
         .and_then(|value| value.as_str())
@@ -51,8 +52,7 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     if rt.is_empty() {
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!("缺少 refresh token，无法刷新，需重新登录");
-        let _ = upsert_account(&account);
-        return account;
+        return save_refresh_failure(&original, &account);
     }
 
     let headers = refresh_headers(&account, &rt);
@@ -69,8 +69,7 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
                 .and_then(|v| v.as_str())
                 .unwrap_or("未知错误")
         ));
-        let _ = upsert_account(&account);
-        return account;
+        return save_refresh_failure(&original, &account);
     }
 
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -82,8 +81,7 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let Some(new_at) = new_at else {
         account["needs_relogin"] = json!(true);
         account["needs_relogin_reason"] = json!("刷新响应缺少 accessToken");
-        let _ = upsert_account(&account);
-        return account;
+        return save_refresh_failure(&original, &account);
     };
 
     account["access_token"] = json!(new_at);
@@ -132,21 +130,24 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let map = account.as_object_mut().unwrap();
     map.remove("needs_relogin");
     map.remove("needs_relogin_reason");
-    if let Err(error) = upsert_account(&account) {
-        // Never propagate an uncommitted refresh to another client's auth file.
-        // A stale async result must not clobber a newer login's credentials.
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            if let Some(current) = account
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(crate::modules::account::find_account)
-            {
-                return current;
+    match persist_refresh_result(&original, &account) {
+        Ok(committed) => account = committed,
+        Err(error) => {
+            // Never propagate an uncommitted refresh to another client's auth file.
+            // A stale async result must not clobber a newer login's credentials.
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                if let Some(current) = account
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(crate::modules::account::find_account)
+                {
+                    return current;
+                }
             }
+            account["needs_relogin"] = json!(true);
+            account["needs_relogin_reason"] = json!("刷新凭证未能安全保存，请重新授权");
+            return account;
         }
-        account["needs_relogin"] = json!(true);
-        account["needs_relogin_reason"] = json!("刷新凭证未能安全保存，请重新授权");
-        return account;
     }
     // Windows 不执行 apiKeyHelper；当前 CLI 账号刷新后同步 settings env。
     // 同步失败不阻断 WorkBuddy 保活；状态接口会根据 settings 与账号库是否
@@ -158,6 +159,68 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
         );
     }
     account
+}
+
+fn merge_refresh_result(
+    current: &mut Value,
+    expected: &Value,
+    updated: &Value,
+) -> std::io::Result<()> {
+    if current["uid"] != expected["uid"]
+        || current["domain"] != expected["domain"]
+        || current["enterpriseId"] != expected["enterpriseId"]
+        || current["enterprise_id"] != expected["enterprise_id"]
+        || !crate::modules::account_repository::same_scope(current, expected)
+        || current["access_token"] != expected["access_token"]
+        || current["refresh_token"] != expected["refresh_token"]
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "账号凭证或身份已经变化",
+        ));
+    }
+    for key in [
+        "access_token",
+        "refresh_token",
+        "expiresAt",
+        "refreshExpiresAt",
+        "refreshedAt",
+        "needs_relogin",
+        "needs_relogin_reason",
+    ] {
+        if let Some(value) = updated.get(key) {
+            current[key] = value.clone();
+        } else {
+            current
+                .as_object_mut()
+                .ok_or_else(|| std::io::Error::other("账号格式无效"))?
+                .remove(key);
+        }
+    }
+    Ok(())
+}
+
+fn persist_refresh_result(expected: &Value, updated: &Value) -> std::io::Result<Value> {
+    crate::modules::account_repository::AccountRepository::new(
+        &crate::modules::config::accounts_file(),
+    )
+    .update(|items| {
+        let current = items
+            .iter_mut()
+            .find(|a| a["id"] == expected["id"])
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::WouldBlock, "账号已不存在"))?;
+        merge_refresh_result(current, expected, updated)?;
+        Ok(current.clone())
+    })
+}
+
+fn save_refresh_failure(expected: &Value, updated: &Value) -> Value {
+    persist_refresh_result(expected, updated).unwrap_or_else(|_| {
+        expected["id"]
+            .as_str()
+            .and_then(crate::modules::account::find_account)
+            .unwrap_or_else(|| updated.clone())
+    })
 }
 
 /// 惰性刷新：expiresAt 缺失或剩余 < lazy_refresh_hours 则刷新。返回最新账号。
@@ -242,6 +305,27 @@ pub async fn run_keepalive_cycle() -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refresh_merges_only_credentials_and_rejects_newer_login() {
+        let expected = serde_json::json!({"id":"a","uid":"u","domain":"www.workbuddy.cn","access_token":"old","refresh_token":"r","note":"old note","is_enabled":true});
+        let mut current = expected.clone();
+        current["note"] = serde_json::json!("new note");
+        current["is_enabled"] = serde_json::json!(false);
+        current["capability_credentials"] = serde_json::json!({"GrowthRead":{"authorized":true}});
+        let mut updated = expected.clone();
+        updated["access_token"] = serde_json::json!("refreshed");
+        super::merge_refresh_result(&mut current, &expected, &updated).unwrap();
+        assert_eq!(current["note"], "new note");
+        assert_eq!(current["is_enabled"], false);
+        assert_eq!(current["access_token"], "refreshed");
+        assert_eq!(
+            current["capability_credentials"]["GrowthRead"]["authorized"],
+            true
+        );
+        let before = current.clone();
+        assert!(super::merge_refresh_result(&mut current, &expected, &updated).is_err());
+        assert_eq!(current, before);
+    }
     use super::*;
 
     #[test]

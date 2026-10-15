@@ -1,5 +1,6 @@
 import BackupsPage from "@/pages/BackupsPage";
 import OperationLogsPage from "@/pages/OperationLogsPage";
+import GrowthTasksPage from "@/pages/GrowthTasksPage";
 import { useState } from "react";
 import { toast } from "sonner";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
@@ -282,6 +283,7 @@ function Layout() {
           </NavLink>
           <NavLink to="/auto-checkin" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><CalendarClock className="size-4" />自动签到</NavLink>
           <NavLink to="/backups" className="rounded-lg px-3 py-2.5 text-sm text-muted-foreground">备份与恢复</NavLink>
+          <NavLink to="/growth-tasks" className="rounded-lg px-3 py-2.5 text-sm text-muted-foreground">成长任务</NavLink>
           <NavLink to="/operation-logs" className="rounded-lg px-3 py-2.5 text-sm text-muted-foreground">操作日志</NavLink>
           {sessionsNavEnabled && (
             <NavLink
@@ -357,6 +359,7 @@ export default function App() {
             <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/auto-checkin" element={<AutoCheckinPage />} />
+            <Route path="/growth-tasks" element={<GrowthTasksPage />} />
             <Route path="/backups" element={<BackupsPage />} />
             <Route path="/operation-logs" element={<OperationLogsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
