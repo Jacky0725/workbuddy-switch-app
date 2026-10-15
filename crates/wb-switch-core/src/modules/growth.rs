@@ -66,7 +66,7 @@ pub(crate) fn identity(a: &Value) -> String {
             a["uid"],
             a["domain"],
             a["provider"],
-            a["region"],
+            super::account_repository::scope_of(a),
             a["enterpriseId"],
             a["enterprise_id"]
         ])
@@ -468,5 +468,11 @@ mod tests {
         let snapshot = snapshot_at(&root, &[json!({"id":"a","uid":"new","variant":"cn"})]).unwrap();
         assert!(snapshot.accounts[0].tasks.is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn canonical_region_changes_invalidate_growth_identity() {
+        let cn = json!({"id":"a","uid":"fictional","variant":"cn"});
+        let global = json!({"id":"a","uid":"fictional","variant":"ai"});
+        assert_ne!(identity(&cn), identity(&global));
     }
 }
