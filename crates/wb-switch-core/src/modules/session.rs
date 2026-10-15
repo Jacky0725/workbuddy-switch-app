@@ -574,6 +574,7 @@ fn insert_session_copy(
     };
 
     crate::modules::session_safety::validate_local_transfer_row(&source_row)?;
+    crate::modules::session_shared_assets::buddy_identity(source_paths, cid)?;
 
     let Some(mut conn) = open_db(&dst_db, false) else {
         return Err("会话数据无法打开".to_string());
@@ -624,6 +625,7 @@ fn insert_session_copy(
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|_| "数据库正在被占用，已停止复制".to_string())?;
+    crate::modules::session_shared_assets::validate_buddy_row(&tx, &source_row)?;
     tx.execute(&sql, rusqlite::params_from_iter(params))
         .map_err(|e| format!("会话记录保存失败：{e}"))?;
     session_backup::verify_database_integrity(&tx)?;
@@ -700,6 +702,7 @@ fn read_existing_transfer_row(
 fn validate_existing_transfer_row(paths: &SessionPaths, cid: &str) -> Result<(), String> {
     if let Some(row) = read_existing_transfer_row(paths, cid)? {
         crate::modules::session_safety::validate_local_transfer_row(&row)?;
+        crate::modules::session_shared_assets::buddy_identity(paths, cid)?;
     }
     Ok(())
 }
@@ -1176,6 +1179,8 @@ fn write_copy_body(
             .map_err(|error| format!("目标工作区目录创建失败：{error}"))?;
     }
     crate::modules::session_safety::validate_transfer_body(&snapshot.text)?;
+    let attachment_digest =
+        crate::modules::session_shared_assets::attachment_identity(source_paths, &snapshot.text)?;
     let history = crate::modules::session_resources::snapshot(source_paths, cid, &snapshot.text)?;
     crate::modules::session_resources::install(target_paths, new_cid, &history)?;
     let text = snapshot.text.replace(cid, new_cid);
@@ -1186,6 +1191,13 @@ fn write_copy_body(
         ContentState::Ready(read_back)
             if read_back.normalized.total_digest == snapshot.normalized.total_digest =>
         {
+            if crate::modules::session_shared_assets::attachment_identity(
+                target_paths,
+                &read_back.text,
+            )? != attachment_digest
+            {
+                return Err("附件在复制期间发生变化，已停止完成操作".into());
+            }
             Ok(dest)
         }
         ContentState::Ready(_) => Err("复制后的内容保存后校验不一致，未按成功处理".to_string()),
@@ -1244,6 +1256,10 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
     };
     crate::modules::session_safety::validate_transfer_body(&snapshot.text)?;
     crate::modules::session_resources::snapshot(context.source_paths, cid, &snapshot.text)?;
+    crate::modules::session_shared_assets::attachment_identity(
+        context.source_paths,
+        &snapshot.text,
+    )?;
     let source_owner = session_row_owner(context.source_paths, cid);
     match source_owner.as_deref() {
         Some(owner) if owner == context.source_uid => {}
@@ -1451,6 +1467,12 @@ fn finish_copy_from_body(
         DbCopyOutcome::NoDb => return Err("会话数据不存在，未复制".to_string()),
     }
     verify_session_row(paths, &operation.target.session_id, &operation.target.uid)?;
+    crate::modules::session_shared_assets::require_same_buddy(
+        source_paths,
+        &operation.source.session_id,
+        paths,
+        &operation.target.session_id,
+    )?;
     advance_operation(paths, operation, OpPhase::DbWritten)?;
 
     // 云端登记交接给客户端：不预写 edge_sync_mapping——预写会让 edge-sync 扩展
@@ -1732,6 +1754,17 @@ pub(crate) fn member_content_state(paths: &SessionPaths, session_id: &str) -> Co
                             &snapshot.text,
                         )
                         .map(|_| ())
+                    })
+                    .and_then(|_| {
+                        crate::modules::session_shared_assets::attachment_identity(
+                            paths,
+                            &snapshot.text,
+                        )
+                        .map(|_| ())
+                    })
+                    .and_then(|_| {
+                        crate::modules::session_shared_assets::buddy_identity(paths, session_id)
+                            .map(|_| ())
                     }) {
                     Ok(()) => ContentState::Ready(snapshot),
                     Err(reason) => ContentState::Unavailable(reason),
@@ -1836,22 +1869,57 @@ fn bind_history_resources(
     target_content: &ContentState,
 ) -> Result<(), String> {
     if let ContentState::Ready(content) = source_content {
-        binding.source.resource_digest = crate::modules::session_resources::snapshot(
-            source_paths,
-            &source.session_id,
-            &content.text,
-        )?
-        .identity();
+        binding.source.resource_digest = combined_resource_identity(
+            crate::modules::session_resources::snapshot(
+                source_paths,
+                &source.session_id,
+                &content.text,
+            )?
+            .identity(),
+            crate::modules::session_shared_assets::attachment_identity(
+                source_paths,
+                &content.text,
+            )?,
+            crate::modules::session_shared_assets::buddy_identity(
+                source_paths,
+                &source.session_id,
+            )?,
+        );
     }
     if let ContentState::Ready(content) = target_content {
-        binding.target.resource_digest = crate::modules::session_resources::snapshot(
-            target_paths,
-            &target.session_id,
-            &content.text,
-        )?
-        .identity();
+        binding.target.resource_digest = combined_resource_identity(
+            crate::modules::session_resources::snapshot(
+                target_paths,
+                &target.session_id,
+                &content.text,
+            )?
+            .identity(),
+            crate::modules::session_shared_assets::attachment_identity(
+                target_paths,
+                &content.text,
+            )?,
+            crate::modules::session_shared_assets::buddy_identity(
+                target_paths,
+                &target.session_id,
+            )?,
+        );
     }
     Ok(())
+}
+
+fn combined_resource_identity(
+    history: Option<String>,
+    attachments: Option<String>,
+    buddy: Option<String>,
+) -> Option<String> {
+    if history.is_none() && attachments.is_none() && buddy.is_none() {
+        return None;
+    }
+    Some(full_digest_of(
+        serde_json::json!([history, attachments, buddy])
+            .to_string()
+            .as_bytes(),
+    ))
 }
 
 /// 由实时状态组装预览绑定（预览与执行前核对共用一份装配逻辑）。
@@ -2112,6 +2180,14 @@ fn preview_group_item(
         && member_row_owned_by(&target_paths, target_member);
     let transfer_problem = validate_existing_transfer_row(&source_paths, &source_member.session_id)
         .and_then(|_| validate_existing_transfer_row(&target_paths, &target_member.session_id))
+        .and_then(|_| {
+            crate::modules::session_shared_assets::require_same_buddy(
+                &source_paths,
+                &source_member.session_id,
+                &target_paths,
+                &target_member.session_id,
+            )
+        })
         .err();
     let decision = if let Some(reason) = transfer_problem {
         SyncDecision::unknown(reason)
@@ -2201,6 +2277,9 @@ struct SyncWritePlan {
     source_snapshot: ContentSnapshot,
     target_snapshot: ContentSnapshot,
     history_resources: crate::modules::session_resources::HistoryBundle,
+    attachment_digest: Option<String>,
+    target_attachment_digest: Option<String>,
+    buddy_digest: Option<String>,
     /// 待写入目标的新正文：来源正文按本副本 sessionId 替换为目标 sessionId。
     incoming_text: String,
     /// 待写入正文的归一化内容（执行后据此复算摘要核验）。
@@ -2293,6 +2372,14 @@ fn plan_sync_selection(
     }
     if let Err(message) = validate_existing_transfer_row(source_paths, &source_member.session_id)
         .and_then(|_| validate_existing_transfer_row(paths, &target_member.session_id))
+        .and_then(|_| {
+            crate::modules::session_shared_assets::require_same_buddy(
+                source_paths,
+                &source_member.session_id,
+                paths,
+                &target_member.session_id,
+            )
+        })
     {
         return SyncItemOutcome::Rejected { message };
     }
@@ -2366,7 +2453,33 @@ fn plan_sync_selection(
         Ok(resources) => resources,
         Err(message) => return SyncItemOutcome::Rejected { message },
     };
-    if history_resources.identity() != live.source.resource_digest {
+    let attachment_digest = match crate::modules::session_shared_assets::attachment_identity(
+        source_paths,
+        &source_snapshot.text,
+    ) {
+        Ok(v) => v,
+        Err(message) => return SyncItemOutcome::Rejected { message },
+    };
+    let target_attachment_digest = match crate::modules::session_shared_assets::attachment_identity(
+        paths,
+        &target_snapshot.text,
+    ) {
+        Ok(v) => v,
+        Err(message) => return SyncItemOutcome::Rejected { message },
+    };
+    let buddy_digest = match crate::modules::session_shared_assets::buddy_identity(
+        source_paths,
+        &source_member.session_id,
+    ) {
+        Ok(v) => v,
+        Err(message) => return SyncItemOutcome::Rejected { message },
+    };
+    if combined_resource_identity(
+        history_resources.identity(),
+        attachment_digest.clone(),
+        buddy_digest.clone(),
+    ) != live.source.resource_digest
+    {
         return skip("文件历史资源已变化，请重新检查".into());
     }
     SyncItemOutcome::Validated {
@@ -2381,6 +2494,9 @@ fn plan_sync_selection(
             source_snapshot: source_snapshot.clone(),
             target_snapshot: target_snapshot.clone(),
             history_resources,
+            attachment_digest,
+            target_attachment_digest,
+            buddy_digest,
             incoming_text,
             incoming,
             old_baseline_ref: live.baseline_ref,
@@ -2840,6 +2956,12 @@ struct SyncBackupManifest {
     created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     history_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachment_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_attachment_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    buddy_digest: Option<String>,
     /// 目标正文的绝对路径（恢复补写用；使用时必须校验落在本项目录内）。
     target_body_path: String,
     source: SyncBackupMember,
@@ -3097,6 +3219,9 @@ fn create_sync_backup(
         verdict: plan.verdict,
         created_at: now_ms(),
         history_digest: plan.history_resources.identity(),
+        attachment_digest: plan.attachment_digest.clone(),
+        target_attachment_digest: plan.target_attachment_digest.clone(),
+        buddy_digest: plan.buddy_digest.clone(),
         target_body_path: target_body_path.to_string_lossy().to_string(),
         source: SyncBackupMember {
             member_id: plan.source_member.member_id.clone(),
@@ -3230,6 +3355,11 @@ fn apply_sync_body(
     }
     let text =
         String::from_utf8(bytes).map_err(|_| "待保存内容不是合法 UTF-8，未保存".to_string())?;
+    if crate::modules::session_shared_assets::attachment_identity(paths, &text)?
+        != manifest.attachment_digest
+    {
+        return Err("附件与同步备份摘要不一致，已停止保存".into());
+    }
     let resources = crate::modules::session_resources::load(backup_dir, &text)?;
     if resources.identity() != manifest.history_digest {
         return Err("文件历史资源与同步备份摘要不一致，已停止保存".into());
@@ -3264,6 +3394,7 @@ fn update_target_session_row(
         .map_err(|error| format!("会话数据事务开启失败：{error}"))?;
     if let Some(row) = read_source_session_row(&tx, &target.session_id, &target.uid)? {
         crate::modules::session_safety::validate_local_transfer_row(&row)?;
+        crate::modules::session_shared_assets::validate_buddy_row(&tx, &row)?;
     }
     let affected = tx
         .execute(
@@ -3401,6 +3532,11 @@ fn restore_sync_backup_body(
     }
     let text =
         String::from_utf8(bytes).map_err(|_| "备份内容不是合法 UTF-8，未回滚".to_string())?;
+    if crate::modules::session_shared_assets::attachment_identity(paths, &text)?
+        != manifest.target_attachment_digest
+    {
+        return Err("原附件已变化或不可用，已停止回滚".into());
+    }
     let target_body_path = validated_target_body_path(paths, manifest)?;
     session_backup::durable_write_str(&target_body_path, &text)
         .map_err(|error| format!("目标内容回滚失败：{error}"))
@@ -3418,6 +3554,11 @@ fn run_sync_phases(
     body: SyncBodyState,
 ) -> Result<(), String> {
     validate_existing_transfer_row(paths, &operation.target.session_id)?;
+    if crate::modules::session_shared_assets::buddy_identity(paths, &operation.target.session_id)?
+        != manifest.buddy_digest
+    {
+        return Err("Buddy 绑定已变化，已停止同步或恢复".into());
+    }
     let normalized = match body {
         // 已写入：只核验现场，不重写。
         SyncBodyState::Ours => {
@@ -3429,6 +3570,13 @@ fn run_sync_phases(
                 ContentState::Ready(content)
                     if content.normalized.total_digest == operation.expected_content_digest =>
                 {
+                    if crate::modules::session_shared_assets::attachment_identity(
+                        paths,
+                        &content.text,
+                    )? != manifest.attachment_digest
+                    {
+                        return Err("附件已变化，已停止恢复".into());
+                    }
                     let resources =
                         crate::modules::session_resources::load(backup_dir, &content.text)?;
                     if resources.identity() != manifest.history_digest {
@@ -3515,6 +3663,27 @@ fn execute_sync_item(
     }
     validate_existing_transfer_row(context.source_paths, &plan.source_member.session_id)?;
     validate_existing_transfer_row(paths, &plan.target_member.session_id)?;
+    crate::modules::session_shared_assets::require_same_buddy(
+        context.source_paths,
+        &plan.source_member.session_id,
+        paths,
+        &plan.target_member.session_id,
+    )?;
+    if crate::modules::session_shared_assets::buddy_identity(
+        context.source_paths,
+        &plan.source_member.session_id,
+    )? != plan.buddy_digest
+        || crate::modules::session_shared_assets::attachment_identity(
+            context.source_paths,
+            &plan.source_snapshot.text,
+        )? != plan.attachment_digest
+        || crate::modules::session_shared_assets::attachment_identity(
+            paths,
+            &plan.target_snapshot.text,
+        )? != plan.target_attachment_digest
+    {
+        return Err("附件或 Buddy 资源已变化，请重新检查".into());
+    }
     let target_body_path = find_project_jsonl(paths, &plan.target_member.session_id)
         .ok_or_else(|| "目标内容不存在，未同步".to_string())?;
     crate::modules::session_safety::preflight_target_database(paths)?;
@@ -3855,6 +4024,14 @@ fn recover_sync_operation(paths: &SessionPaths, mut operation: Operation) -> Rec
             {
                 return needs(reason, false);
             }
+            match crate::modules::session_shared_assets::buddy_identity(
+                paths,
+                &operation.target.session_id,
+            ) {
+                Ok(digest) if digest == manifest.buddy_digest => {}
+                Ok(_) => return needs("Buddy 绑定已变化，已停止恢复".into(), false),
+                Err(reason) => return needs(reason, false),
+            }
         }
         Ok(None) => {}
         Err(reason) => return needs(reason, false),
@@ -3976,6 +4153,11 @@ fn recover_copy_operation(
             if let Err(error) = crate::modules::session_safety::validate_transfer_body(&text) {
                 return needs(error, false);
             }
+            if let Err(error) =
+                crate::modules::session_shared_assets::attachment_identity(paths, &text)
+            {
+                return needs(error, false);
+            }
             if crate::modules::session_resources::snapshot(
                 paths,
                 &operation.target.session_id,
@@ -4081,6 +4263,14 @@ fn recover_copy_operation(
         return needs(error, true);
     }
 
+    if let Err(error) = crate::modules::session_shared_assets::require_same_buddy(
+        read_paths,
+        &operation.source.session_id,
+        paths,
+        &operation.target.session_id,
+    ) {
+        return needs(error, false);
+    }
     // 3) 云端登记已交接给客户端（不预写 edge_sync_mapping）：这里只推进阶段，
     // 不写入、不核验映射行——该行由 edge-sync 扩展在客户端下次启动时写入，
     // 工具恢复时不能要求它已存在，否则会误报 needsRecovery。
@@ -4512,6 +4702,149 @@ mod tests {
         env.add_session("sess-1", "uid-a", "标题一");
         env.add_body("sess-1", &body_text("sess-1"));
         env
+    }
+
+    fn add_test_buddy(env: &Env) {
+        use sha2::{Digest, Sha256};
+        let config = r#"{"version":1}"#;
+        let preimage = format!("{{\"config\":{config},\"identity\":{{\"applicationId\":\"fictional\",\"templateId\":\"test\",\"schemaVersion\":1,\"templateVersion\":1}}}}");
+        let digest = format!("{:x}", Sha256::digest(preimage.as_bytes()));
+        let id = format!("bs_{digest}");
+        let binding = json!({"version":1,"snapshotId":id,"selection":{},"runtime":{"industryMode":{"applicationId":"fictional","resourceSnapshotKey":id}},"presentation":{},"continuation":{},"resources":{"resourceSnapshotKey":id}}).to_string();
+        let db = Connection::open(env.paths.workbuddy_db()).unwrap();
+        db.execute_batch("ALTER TABLE sessions ADD COLUMN buddy_snapshot_id TEXT; ALTER TABLE sessions ADD COLUMN buddy_binding_json TEXT; CREATE TABLE buddy_snapshots(snapshot_id TEXT PRIMARY KEY,application_id TEXT,template_id TEXT,schema_version INTEGER,template_version INTEGER,snapshot_format_version INTEGER,config_json TEXT,config_digest TEXT);").unwrap();
+        db.execute(
+            "INSERT INTO buddy_snapshots VALUES (?1,'fictional','test',1,1,1,?2,?3)",
+            rusqlite::params![id, config, digest],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE sessions SET buddy_snapshot_id=?1,buddy_binding_json=?2 WHERE id='sess-1'",
+            rusqlite::params![id, binding],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn buddy_copy_preserves_binding_and_sync_rejects_changed_snapshot() {
+        let env = ready_env("buddy_copy");
+        add_test_buddy(&env);
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert_eq!(report["copied"].as_array().unwrap().len(), 1, "{report}");
+        let target = env.first_copy_id(&report);
+        crate::modules::session_shared_assets::require_same_buddy(
+            &env.paths, "sess-1", &env.paths, &target,
+        )
+        .unwrap();
+        append_records(&env.body_path("sess-1"), "sess-1", 0, 1);
+        let p = preview(&env, "uid-b");
+        let group = &p["groups"][0];
+        let selected = selection(
+            group["groupId"].as_str().unwrap(),
+            group["previewToken"].as_str().unwrap(),
+            SyncMode::FastForward,
+        );
+        let before = std::fs::read(env.body_path(&target)).unwrap();
+        let db = Connection::open(env.paths.workbuddy_db()).unwrap();
+        db.execute("UPDATE buddy_snapshots SET config_json='{}'", [])
+            .unwrap();
+        let report = sync(&env, "uid-b", &[selected]);
+        assert!(report["synced"].as_array().unwrap().is_empty());
+        assert_eq!(before, std::fs::read(env.body_path(&target)).unwrap());
+    }
+
+    #[test]
+    fn missing_buddy_snapshot_prevents_copy() {
+        let env = ready_env("buddy_missing");
+        add_test_buddy(&env);
+        Connection::open(env.paths.workbuddy_db())
+            .unwrap()
+            .execute("DELETE FROM buddy_snapshots", [])
+            .unwrap();
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert!(report["copied"].as_array().unwrap().is_empty());
+        assert!(env.rows_for("uid-b").is_empty());
+    }
+
+    #[test]
+    fn shared_resource_sync_recovery_stops_on_change_and_resumes_after_restore() {
+        for kind in ["buddy", "attachment"] {
+            let env = ready_env(kind);
+            let file = env.root.join("fictional.txt");
+            if kind == "buddy" {
+                add_test_buddy(&env);
+            } else {
+                std::fs::write(&file, "fictional").unwrap();
+                let text = json!({"type":"message","sessionId":"sess-1","content":[{"type":"input_text","text":format!("<attached_files><file path=\"{}\" /></attached_files>",file.display())}]}).to_string()+"\n";
+                env.add_body("sess-1", &text);
+            }
+            let (target, _, _) = interrupted_sync_scene(&env);
+            let before = std::fs::read(env.body_path(&target)).unwrap();
+            let db = Connection::open(env.paths.workbuddy_db()).unwrap();
+            if kind == "buddy" {
+                db.execute("UPDATE buddy_snapshots SET config_json='{}'", [])
+                    .unwrap();
+            } else {
+                std::fs::write(&file, "changed").unwrap();
+            }
+            let report = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+            assert!(report.recovered.is_empty(), "{kind}");
+            assert_eq!(report.needs_recovery.len(), 1, "{kind}");
+            assert_eq!(before, std::fs::read(env.body_path(&target)).unwrap());
+            if kind == "buddy" {
+                db.execute(
+                    "UPDATE buddy_snapshots SET config_json=?1",
+                    [r#"{"version":1}"#],
+                )
+                .unwrap();
+            } else {
+                std::fs::write(&file, "fictional").unwrap();
+            }
+            let report = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+            assert!(report.is_clean(), "{kind}: {:?}", report.needs_recovery);
+            assert_eq!(report.recovered.len(), 1, "{kind}");
+            assert_eq!(before, std::fs::read(env.body_path(&target)).unwrap());
+        }
+    }
+
+    #[test]
+    fn attachment_copy_checks_blob_and_preview_detects_external_change() {
+        use sha2::{Digest, Sha256};
+        let env = ready_env("attachments");
+        let bytes = b"fictional image bytes";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let blob_dir = env.paths.data_root.join("blobs").join(&digest[..2]);
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        let blob = blob_dir.join(format!("{digest}.jpg"));
+        std::fs::write(&blob, bytes).unwrap();
+        let original = env.root.join("fictional.txt");
+        std::fs::write(&original, "fictional attachment").unwrap();
+        let text = json!({"type":"message","sessionId":"sess-1","content":[{"type":"input_image","image":{"type":"image_blob_ref","blob_id":digest,"blob_path":blob,"size":bytes.len(),"mime":"image/jpeg"}},{"type":"input_text","text":format!("<attached_files><file path=\"{}\" /></attached_files>",original.display())}]}).to_string()+"\n";
+        env.add_body("sess-1", &text);
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert_eq!(report["copied"].as_array().unwrap().len(), 1, "{report}");
+        let target = env.first_copy_id(&report);
+        append_records(&env.body_path("sess-1"), "sess-1", 0, 1);
+        let p = preview(&env, "uid-b");
+        let group = &p["groups"][0];
+        let selected = selection(
+            group["groupId"].as_str().unwrap(),
+            group["previewToken"].as_str().unwrap(),
+            SyncMode::FastForward,
+        );
+        let before = std::fs::read(env.body_path(&target)).unwrap();
+        std::fs::write(&original, "changed fictional attachment").unwrap();
+        let report = sync(&env, "uid-b", &[selected]);
+        assert!(report["synced"].as_array().unwrap().is_empty());
+        assert_eq!(before, std::fs::read(env.body_path(&target)).unwrap());
+        std::fs::write(&blob, b"tampered").unwrap();
+        assert!(
+            crate::modules::session_shared_assets::attachment_identity(&env.paths, &text).is_err()
+        );
+        std::fs::remove_file(&blob).unwrap();
+        assert!(
+            crate::modules::session_shared_assets::attachment_identity(&env.paths, &text).is_err()
+        );
     }
 
     /// Exact observed DDL, with only invented identities and invented JSONL records.

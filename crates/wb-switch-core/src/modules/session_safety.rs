@@ -133,7 +133,8 @@ pub(crate) fn validate_local_transfer_row(
 }
 
 /// Recovery may roll back a deleted local row's body. It must still never mutate
-/// cloud/Buddy/group-bound bodies using the legacy local recovery algorithm.
+/// cloud/group-bound bodies using the local recovery algorithm. Buddy references
+/// receive additional snapshot checks in session_shared_assets.
 pub(crate) fn validate_local_transfer_kind(
     row: &[(String, rusqlite::types::Value)],
 ) -> Result<(), String> {
@@ -148,17 +149,13 @@ pub(crate) fn validate_local_transfer_kind(
             return Err("云会话或未知传输类型暂不支持复制、同步或恢复写入".into());
         }
     }
-    for name in [
-        "buddy_snapshot_id",
-        "buddy_binding_json",
-        "group_id",
-        "group_title",
-    ] {
+    crate::modules::session_shared_assets::buddy_reference(row)?;
+    for name in ["group_id", "group_title"] {
         if let Some(value) = field(name) {
             if !matches!(value, Value::Null)
                 && !matches!(value, Value::Text(text) if text.is_empty())
             {
-                return Err("会话含 Buddy 快照或官方分组绑定，尚未验证完整迁移，已停止写入".into());
+                return Err("会话含官方分组绑定，尚未验证完整迁移，已停止写入".into());
             }
         }
     }
