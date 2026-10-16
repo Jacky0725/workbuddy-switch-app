@@ -1,9 +1,9 @@
 // Finite official-runtime adapter. No direct activity-report requests.
 const {spawn}=require('node:child_process');
 const {mkdirSync}=require('node:fs');
-let input='',started=false,child,done=false,timer;
+let input='',started=false,child,done=false,timer,completionTimer;
 function finish(value){
- if(done)return;done=true;clearTimeout(timer);
+ if(done)return;done=true;clearTimeout(timer);clearTimeout(completionTimer);
  if(child){child.stdin.end();child.kill();}
  process.stdout.write(JSON.stringify(value)+'\n',()=>process.exit(0));
 }
@@ -67,7 +67,12 @@ process.stdin.on('data',chunk=>{
      prompt:[{type:'text',text:'请只回复 TEST_OK。不访问网页，不读取或修改文件，不调用工具。'}],
      _meta:{'codebuddy.ai':{mode:'craft'}}});
    }else if(message.id===4&&message.result){
-    finish({submitted,finished:message.result.stopReason==='end_turn',reply_matches:reply.trim()==='TEST_OK'});return;
+    const result={submitted,finished:message.result.stopReason==='end_turn',reply_matches:reply.trim()==='TEST_OK'};
+    // The verified official bundle batches normal events after 2 seconds. Keep
+    // its process alive for that batch and a bounded network margin; only the
+    // subsequent official task GET can establish that progress was counted.
+    if(!completionTimer)completionTimer=setTimeout(()=>finish(result),5000);
+    return;
    }
   }
  });

@@ -19,6 +19,7 @@ process.stdin.on('data',chunk=>{buffer+=chunk;while(buffer.includes('\n')){
   if(process.env.TEST_ACP_SCENARIO==='rejection'){send({jsonrpc:'2.0',id:m.id,error:{code:-32000,message:'fictional rejection'}});continue;}
   send({jsonrpc:'2.0',method:'session/update',params:{update:{sessionUpdate:process.env.TEST_ACP_SCENARIO==='echo'?'user_message_chunk':'agent_message_chunk',content:{type:'text',text:'TEST_OK'}}}});
   send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}});
+  if(process.env.TEST_ACP_SCENARIO==='deferred-completion')setTimeout(()=>fs.appendFileSync(process.env.TEST_ACP_RECORD,JSON.stringify({method:'background-completion'})+'\n'),2000);
  }
 }});
 `;
@@ -38,3 +39,4 @@ test('preflight never sends a model prompt',async t=>{const{result,calls}=await 
 test('echoed user text is not accepted as a model reply',async t=>{const{result}=await invoke(t,'echo');assert.equal(result.reply_matches,false);});
 test('unexpected client operations are rejected without further prompts',async t=>{const{result,calls}=await invoke(t,'client-operation');assert.equal(result.error,'unexpected client operation requested');assert.equal(calls.length,1);});
 test('protocol rejection cannot be reported as completion',async t=>{const{result,calls}=await invoke(t,'rejection');assert.equal(result.finished,undefined);assert.equal(calls.length,1);assert.ok(result.error);});
+test('official runtime remains alive for its deferred completion work',async t=>{const{result,calls}=await invoke(t,'deferred-completion');assert.equal(result.finished,true);assert.equal(result.reply_matches,true);assert.deepEqual(calls.map(c=>c.method),['session/prompt','background-completion']);});
