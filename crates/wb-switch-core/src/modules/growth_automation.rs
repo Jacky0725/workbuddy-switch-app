@@ -101,6 +101,9 @@ pub struct ActivityOperation {
     pub state: OperationState,
     pub submitted_at_ms: i64,
     pub verified_at_ms: Option<i64>,
+    /// Travel writes retain the successful business acknowledgement before readback.
+    #[serde(default)]
+    pub submission_acknowledged: Option<bool>,
     pub error: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
@@ -232,6 +235,7 @@ async fn run_for_account(
                 state: OperationState::AwaitingVerification,
                 submitted_at_ms: config::now_ms(),
                 verified_at_ms: None,
+                submission_acknowledged: None,
                 error: None,
             },
         );

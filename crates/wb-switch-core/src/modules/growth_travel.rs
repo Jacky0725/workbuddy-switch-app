@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 const PREFIX: &str = "/activity/growth/buddy/travel";
+const LEGACY_UNCONFIRMED: &str = "旅行结果尚未核实，禁止重复提交";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TravelState {
     pub account_id: String,
@@ -182,10 +183,15 @@ fn verified(op: &ActivityOperation, s: &TravelState) -> bool {
         .strip_prefix("travel_claim:")
         .and_then(|v| v.parse::<i64>().ok())
     {
-        return s.state == "idle"
-            && s.daily_limit_reached
-            && s.record_id.is_none_or(|id| id == record)
-            && business_date(op.submitted_at_ms) == business_date(config::now_ms());
+        // The daily departure limit resets at midnight independently of claiming
+        // an earlier trip. A success receipt plus retirement of that active record
+        // verifies the claim; the current day's departure allowance is irrelevant.
+        let acknowledged = op.submission_acknowledged.unwrap_or_else(|| {
+            // alpha.6 produced this exact fallback only when both POST (HTTP 200,
+            // business code 0) and status GET succeeded, but its predicate failed.
+            op.error.as_deref() == Some(LEGACY_UNCONFIRMED)
+        });
+        return acknowledged && s.state == "idle" && s.record_id.is_none_or(|id| id == record);
     }
     let location = op
         .task_code
@@ -241,6 +247,9 @@ pub(crate) async fn run_locked(
             && o.state == OperationState::AwaitingVerification
     }) {
         if verified(op, &s) {
+            if op.task_code.starts_with("travel_claim:") {
+                op.submission_acknowledged = Some(true);
+            }
             op.state = OperationState::Verified;
             op.verified_at_ms = Some(config::now_ms());
             op.error = None;
@@ -308,11 +317,13 @@ pub(crate) async fn run_locked(
             state: OperationState::AwaitingVerification,
             submitted_at_ms: config::now_ms(),
             verified_at_ms: None,
+            submission_acknowledged: None,
             error: None,
         },
     );
     growth_automation::save_journal(root, &journal)?;
     let submitted = request(a, action, Some(body)).await;
+    persist_receipt(root, &mut journal, &k, submitted.is_ok())?;
     let after = status(a).await;
     let op = journal.operations.get_mut(&k).unwrap();
     if after.as_ref().is_ok_and(|s| verified(op, s)) {
@@ -324,7 +335,7 @@ pub(crate) async fn run_locked(
             submitted
                 .err()
                 .or_else(|| after.err())
-                .unwrap_or_else(|| "旅行结果尚未核实，禁止重复提交".into()),
+                .unwrap_or_else(|| LEGACY_UNCONFIRMED.into()),
         );
         report.awaiting_verification += 1;
     }
@@ -341,6 +352,16 @@ pub(crate) async fn run_locked(
         .map_err(|_| "旅行用途记录保存失败")?;
     }
     Ok(report)
+}
+fn persist_receipt(
+    root: &Path,
+    journal: &mut growth_automation::Journal,
+    key: &str,
+    acknowledged: bool,
+) -> Result<(), String> {
+    let op = journal.operations.get_mut(key).ok_or("旅行操作记录缺失")?;
+    op.submission_acknowledged = Some(acknowledged);
+    growth_automation::save_journal(root, journal)
 }
 pub fn run(
     account_id: &str,
@@ -389,6 +410,7 @@ mod tests {
             state: OperationState::AwaitingVerification,
             submitted_at_ms: 1_800_000_000_000,
             verified_at_ms: None,
+            submission_acknowledged: None,
             error: None,
         };
         let mut s=parse_state("a",&json!({"state":"traveling","daily_limit_reached":true,"record_id":123,"location":{"id":2},"depart_at":1_800_000_000})).unwrap();
@@ -410,6 +432,7 @@ mod tests {
             state: OperationState::AwaitingVerification,
             submitted_at_ms: config::now_ms(),
             verified_at_ms: None,
+            submission_acknowledged: None,
             error: None,
         };
         let k = key(&old, "claim", "123");
@@ -421,5 +444,67 @@ mod tests {
         )
         .unwrap();
         assert!(!verified(&op, &different));
+    }
+    fn claim_fixture() -> (ActivityOperation, TravelState) {
+        let op = ActivityOperation {
+            operation_id: "fictional".into(),
+            account_id: "a".into(),
+            task_code: "travel_claim:123".into(),
+            state: OperationState::AwaitingVerification,
+            submitted_at_ms: config::now_ms() - 86_400_000,
+            verified_at_ms: None,
+            submission_acknowledged: Some(true),
+            error: None,
+        };
+        let s = parse_state(
+            "a",
+            &json!({"state":"idle","daily_limit_reached":false,"record_id":null}),
+        )
+        .unwrap();
+        (op, s)
+    }
+    #[test]
+    fn acknowledged_claim_survives_midnight_departure_limit_reset() {
+        let (mut op, mut s) = claim_fixture();
+        assert!(verified(&op, &s));
+        s.record_id = Some(999);
+        assert!(!verified(&op, &s));
+        s.record_id = None;
+        s.state = "arrived".into();
+        assert!(!verified(&op, &s));
+        s.state = "idle".into();
+        op.submission_acknowledged = Some(false);
+        assert!(!verified(&op, &s));
+        op.submission_acknowledged = None;
+        assert!(!verified(&op, &s));
+    }
+    #[test]
+    fn legacy_fallback_recovers_only_the_known_successful_acknowledgement() {
+        let (mut op, s) = claim_fixture();
+        op.submission_acknowledged = None;
+        op.error = Some(LEGACY_UNCONFIRMED.into());
+        assert!(verified(&op, &s));
+        op.submission_acknowledged = Some(false);
+        assert!(!verified(&op, &s));
+        op.submission_acknowledged = None;
+        op.error = Some("旅行请求结果未知，等待核实".into());
+        assert!(!verified(&op, &s));
+    }
+    #[test]
+    fn successful_receipt_is_durable_before_readback_or_restart() {
+        let root = std::env::temp_dir().join(format!("travel-receipt-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (mut op, s) = claim_fixture();
+        op.submission_acknowledged = None;
+        let mut journal = growth_automation::read_journal(&root).unwrap();
+        journal.operations.insert("key".into(), op);
+        persist_receipt(&root, &mut journal, "key", true).unwrap();
+        drop(journal);
+        let restored = growth_automation::read_journal(&root).unwrap();
+        let op = &restored.operations["key"];
+        assert_eq!(op.state, OperationState::AwaitingVerification);
+        assert_eq!(op.submission_acknowledged, Some(true));
+        assert!(verified(op, &s));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
