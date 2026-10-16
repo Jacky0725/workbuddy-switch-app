@@ -12,3 +12,6 @@ it("过期和锁定优先于可领取的视觉状态",()=>{
   expect(growthTaskStatus({...task,accept_status:"completed",locked:true})).toBe("尚未解锁");
   expect(growthTaskStatus({...task,progress_complete:false,accept_status:"unknown"})).toBe("任务状态待核实");
 });
+it("官方进行中状态保留未完成含义",()=>{
+  expect(growthTaskStatus({...task,accept_status:"in_progress",current:1,progress_complete:false})).toBe("进行中 · 尚未完成");
+});

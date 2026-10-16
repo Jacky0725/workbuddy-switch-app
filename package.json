@@ -12,6 +12,7 @@
     "build": "node scripts/prepare-companion-demo.mjs clean && tsc && vite build",
     "build:desktop": "node scripts/prepare-agent-companion.mjs build && npm run build && node scripts/prepare-agent-companion.mjs copy",
     "build:demo": "node scripts/prepare-companion-demo.mjs build && tsc && VITE_DEMO_MODE=1 VITE_PAGES_DEMO=1 vite build && node scripts/prepare-companion-demo.mjs copy",
+    "pretest": "node scripts/test-growth-acp.cjs",
     "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri",

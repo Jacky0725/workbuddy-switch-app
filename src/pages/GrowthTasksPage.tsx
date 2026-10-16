@@ -85,7 +85,7 @@ export default function GrowthTasksPage() {
       <label className="flex gap-2"><input type="checkbox" checked={plan.config.travel_depart} disabled={busy} onChange={e => setPlan({...plan, config:{...plan.config, travel_depart:e.target.checked}})} />每日自动出发（先查询账号旅行状态并选择下方目的地）</label>
       <label className="flex items-center gap-2">北京时间 <input type="time" value={plan.config.daily_time} disabled={busy} onChange={e => setPlan({...plan,config:{...plan.config,daily_time:e.target.value}})} className="rounded border bg-background p-1" /></label>
       <div className="flex flex-wrap gap-4">{accounts.map(a => <label key={a.id} className="flex gap-2"><input type="checkbox" checked={plan.config.account_ids.includes(a.id)} disabled={busy} onChange={e => setPlan({...plan,config:{...plan.config,account_ids:e.target.checked ? [...plan.config.account_ids,a.id] : plan.config.account_ids.filter(id=>id!==a.id)}})} />{a.note || a.nickname || a.id}</label>)}</div>
-      <p className="text-muted-foreground">仅领取已完成的五次对话、技能任务奖励。当前不会自动发送对话或执行技能。</p>
+      <p className="text-muted-foreground">仅领取已完成的五次对话、技能、资料库任务奖励。当前不会自动发送对话或执行技能。</p>
       <p>最近开始：{beijingTime(plan.state.last_started_ms)} · 完成：{beijingTime(plan.state.finished_ms)}</p>
       {plan.state.error && <p className="text-destructive">{plan.state.error}</p>}
       <Button disabled={busy} onClick={() => void savePlan()}>保存成长计划</Button>
@@ -111,7 +111,7 @@ export default function GrowthTasksPage() {
     </CardContent></Card>
     {message && <p role="status" className="text-sm">{message}</p>}
     {error && <Alert variant="destructive"><AlertTitle>操作未完成</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
-    {operations.filter(op => op.state === "AwaitingVerification" && (!selected || op.account_id === selected)).map(op => <Alert key={op.operation_id}><AlertTitle>领取结果待核实</AlertTitle><AlertDescription>{accounts.find(a => a.id === op.account_id)?.note || op.account_id} · {op.task_code}：{op.error || "等待官方状态确认"}。系统不会重复提交。</AlertDescription></Alert>)}
+    {operations.filter(op => op.state === "AwaitingVerification" && (!selected || op.account_id === selected)).map(op => <Alert key={op.operation_id}><AlertTitle>成长操作结果待核实</AlertTitle><AlertDescription>{accounts.find(a => a.id === op.account_id)?.note || op.account_id} · {op.task_code}：{op.error || "等待官方状态确认"}。系统不会重复提交。</AlertDescription></Alert>)}
     {data?.accounts.filter(row => !selected || row.account_id === selected).map(row => {
       const account = accounts.find(a => a.id === row.account_id);
       return <Card key={row.account_id}><CardHeader><CardTitle>{account?.note || account?.nickname || row.account_id}</CardTitle>
