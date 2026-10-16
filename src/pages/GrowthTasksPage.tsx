@@ -95,7 +95,7 @@ export default function GrowthTasksPage() {
         <option value="">全部账号</option>{accounts.map(a => <option key={a.id} value={a.id}>{a.note || a.nickname || a.id}</option>)}
       </select><Button onClick={() => void refresh()} disabled={busy}>刷新官方状态</Button>
       <Button onClick={() => void claim()} disabled={busy}>领取已完成奖励</Button>
-      <span className="text-sm text-muted-foreground">{busy ? "处理中…" : "支持五次对话、技能任务；领取前自动查询"}</span>
+      <span className="text-sm text-muted-foreground">{busy ? "处理中…" : "支持五次对话、技能、资料库任务；领取前自动查询"}</span>
     </div>
     <Card><CardHeader><CardTitle>旅行</CardTitle></CardHeader><CardContent className="space-y-3 text-sm">
       <p>选择单个账号后查询官方旅行状态。</p>

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, future::Future, path::Path, pin::Pin, time::Duration};
 
-pub const CLAIM_CODES: &[&str] = &["chat_5", "skill_1"];
+pub const CLAIM_CODES: &[&str] = &["chat_5", "skill_1", "Library_read"];
 type ListFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<GrowthTask>, String>> + Send + 'a>>;
 type SubmitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 trait ClaimApi: Sync {
@@ -478,6 +478,31 @@ mod tests {
         assert!(r.halted);
         let mut restored = read_journal(&root).unwrap();
         run_for_account(&root, &a, &api, &mut restored, &mut r, true)
+            .await
+            .unwrap();
+        assert_eq!(api.posts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn completed_library_intro_is_claimed_once_across_restart() {
+        let (root, a, mut t) = fixture();
+        t.code = "Library_read".into();
+        t.current = Some(1);
+        t.target = Some(1);
+        let api = Fake {
+            tasks: Mutex::new(vec![t]),
+            posts: 0.into(),
+            ack: true,
+            confirm: true,
+        };
+        let mut journal = Journal::default();
+        let mut report = RunReport::default();
+        run_for_account(&root, &a, &api, &mut journal, &mut report, true)
+            .await
+            .unwrap();
+        assert_eq!(report.verified, 1);
+        let mut restored = read_journal(&root).unwrap();
+        run_for_account(&root, &a, &api, &mut restored, &mut report, true)
             .await
             .unwrap();
         assert_eq!(api.posts.load(std::sync::atomic::Ordering::SeqCst), 1);
