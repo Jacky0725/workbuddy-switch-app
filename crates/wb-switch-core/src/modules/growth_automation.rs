@@ -309,10 +309,10 @@ pub(crate) async fn run_claims_locked(
     let mut journal = read_journal(root)?;
     let mut report = RunReport::default();
     if automatic_ids.is_some()
-        && journal
-            .operations
-            .values()
-            .any(|op| op.state == OperationState::AwaitingVerification)
+        && journal.operations.values().any(|op| {
+            op.state == OperationState::AwaitingVerification
+                && super::growth_execution::blocks_other_accounts(op)
+        })
     {
         // Read every selected account before permitting any further POST; rotation is
         // not a retry strategy for a rejected or unknown write.
@@ -343,11 +343,10 @@ pub(crate) async fn run_claims_locked(
                 report.errors.push(e);
             }
         }
-        if journal
-            .operations
-            .values()
-            .any(|op| op.state == OperationState::AwaitingVerification)
-        {
+        if journal.operations.values().any(|op| {
+            op.state == OperationState::AwaitingVerification
+                && super::growth_execution::blocks_other_accounts(op)
+        }) {
             report.halted = true;
             report
                 .errors

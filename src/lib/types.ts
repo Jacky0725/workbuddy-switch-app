@@ -436,7 +436,7 @@ export interface GrowthSnapshot {
 export interface GrowthRunReport { verified: number; already_claimed: number; awaiting_verification: number; skipped: number; waiting:number; halted:boolean; errors: string[]; }
 export interface GrowthConfig { version: number; enabled: boolean; auto_claim: boolean; account_ids: string[]; daily_time: string; travel_claim:boolean; travel_depart:boolean; travel_location_id:number|null; }
 export interface GrowthTravel { state:{account_id:string;state:"idle"|"traveling"|"arrived";daily_limit_reached:boolean;record_id:number|null;location_id:number|null;depart_at:number|null;arrive_at:number|null}; enabled:boolean; locations:{id:number;name:string}[]; }
-export interface GrowthSchedule { config: GrowthConfig; revision: string; running: boolean; state: { date: string; last_started_ms: number | null; finished_ms: number | null; next_retry_ms: number | null; error: string | null; }; }
+export interface GrowthSchedule { chat_execution_enabled: boolean; config: GrowthConfig; revision: string; running: boolean; state: { date: string; last_started_ms: number | null; finished_ms: number | null; next_retry_ms: number | null; error: string | null; }; }
 export interface GrowthOperation { operation_id: string; account_id: string; task_code: string; state: "AwaitingVerification" | "Verified"; submitted_at_ms: number; verified_at_ms: number | null; error: string | null; }
 export type ManagerTaskStatus = "Success" | "AlreadyCompleted" | "AuthExpired" | "RequiresUserAction" | "RateLimited" | "NetworkError" | "ServerError" | "Unsupported" | "Unknown" | "Cancelled" | "InProgress";
 export interface ManagerDailyTask {

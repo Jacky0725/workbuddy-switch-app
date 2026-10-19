@@ -203,7 +203,7 @@ fn snapshot_at(root: &Path, accounts: &[Value]) -> Result<GrowthSnapshot, String
         execution_status: if schedule.is_err() {
             "成长计划不可读取，自动执行已暂停"
         } else if enabled {
-            "成长计划已启用；普通领奖与旅行分别遵循所选开关"
+            "成长计划已启用；聊天执行、普通领奖与旅行分别遵循所选开关"
         } else {
             "成长计划未启用；可手动查询、领取已完成奖励及处理旅行"
         }

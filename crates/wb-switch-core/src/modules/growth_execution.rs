@@ -22,9 +22,18 @@ trait Api: Sync {
 struct Official<'a> {
     account: &'a Value,
     root: &'a Path,
+    automatic: bool,
 }
 impl Official<'_> {
     fn current(&self) -> Result<Value, String> {
+        if self.automatic
+            && !super::growth_schedule::allows_chat(
+                self.root,
+                self.account["id"].as_str().unwrap_or(""),
+            )?
+        {
+            return Err("自动聊天已关闭或账号已移除，停止后续动作".into());
+        }
         let current = account::find_account(self.account["id"].as_str().ok_or("账号标识缺失")?)
             .ok_or("账号已移除")?;
         if growth::identity(&current) != growth::identity(self.account)
@@ -103,6 +112,17 @@ pub struct ExecutionReport {
     pub budget_exhausted: bool,
     pub skipped: bool,
     pub halted: bool,
+}
+pub(crate) fn blocks_other_accounts(op: &ActivityOperation) -> bool {
+    !(matches!(
+        op.task_code.as_str(),
+        "chat_5/execute/0"
+            | "chat_5/execute/1"
+            | "chat_5/execute/2"
+            | "chat_5/execute/3"
+            | "chat_5/execute/4"
+    ) && op.submission_acknowledged == Some(true)
+        && op.error.as_deref() == Some("等待官方进度核实，禁止重发"))
 }
 fn key(a: &Value, t: &GrowthTask, kind: &str) -> String {
     format!(
@@ -229,16 +249,7 @@ async fn drive(
         // A completed official prompt with delayed progress pauses its own
         // account. Rejection/unknown runtime results and other writes still
         // block the batch; changing accounts must never retry those actions.
-        let acknowledged_chat = matches!(
-            op.task_code.as_str(),
-            "chat_5/execute/0"
-                | "chat_5/execute/1"
-                | "chat_5/execute/2"
-                | "chat_5/execute/3"
-                | "chat_5/execute/4"
-        ) && op.submission_acknowledged == Some(true)
-            && op.error.as_deref() == Some("等待官方进度核实，禁止重发");
-        op.account_id == a["id"].as_str().unwrap_or("") || !acknowledged_chat
+        op.account_id == a["id"].as_str().unwrap_or("") || blocks_other_accounts(op)
     }) {
         report.awaiting_verification = true;
         return Ok(report);
@@ -332,8 +343,7 @@ async fn drive(
     report.budget_exhausted = t.current.is_some_and(|p| p < 5);
     Ok(report)
 }
-/// Explicit finite validation entry point. Zero only reconciles through official GETs.
-/// Scheduler/UI activation awaits full acceptance.
+/// Explicit finite execution entry point. Zero only reconciles through official GETs.
 pub fn run(
     account_id: &str,
     max_actions: u8,
@@ -352,6 +362,21 @@ pub fn run(
             .open(root.join("locks/growth.lock"))
             .map_err(|_| "成长锁不可读取")?;
         lock.try_lock_exclusive().map_err(|_| "成长操作正在运行")?;
+        run_locked(&root, account_id, max_actions, false).await
+    })
+}
+/// Caller holds the shared growth lock. Automatic calls recheck configuration
+/// before each side effect; zero budget is always reconciliation only.
+pub(crate) fn run_locked<'a>(
+    root: &'a Path,
+    account_id: &'a str,
+    max_actions: u8,
+    automatic: bool,
+) -> Pin<Box<dyn Future<Output = Result<ExecutionReport, String>> + Send + 'a>> {
+    Box::pin(async move {
+        if max_actions > 5 {
+            return Err("单次执行上限不得超过 5 条".into());
+        }
         let a = account::find_account(account_id).ok_or("账号不存在")?;
         let a = growth::prepare_account(&a).await;
         if let Some(error) = growth::query_error(&a) {
@@ -359,14 +384,25 @@ pub fn run(
         }
         let api = Official {
             account: &a,
-            root: &root,
+            root,
+            automatic,
         };
-        let mut result = drive(&root, &a, &api, max_actions).await?;
+        let mut result = drive(root, &a, &api, max_actions).await?;
         if !result.awaiting_verification && !result.skipped && !result.halted {
             let t = task(&api).await?;
-            if max_actions > 0 && t.accept_status == "completed" {
-                let claim =
-                    growth_automation::run_claims_locked(&root, Some(account_id), None).await?;
+            if max_actions > 0
+                && t.accept_status == "completed"
+                && (!automatic
+                    || (super::growth_schedule::allows_chat(root, account_id)?
+                        && super::growth_schedule::allows(account_id)?))
+            {
+                let ids = vec![account_id.to_string()];
+                let claim = growth_automation::run_claims_locked(
+                    root,
+                    Some(account_id),
+                    if automatic { Some(&ids) } else { None },
+                )
+                .await?;
                 result.awaiting_verification |= claim.awaiting_verification > 0;
                 result.halted |= claim.halted || !claim.errors.is_empty();
             }
@@ -404,6 +440,22 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Mutex,
     };
+    #[tokio::test]
+    async fn disabled_automatic_chat_stops_before_account_or_runtime_access() {
+        let root = std::env::temp_dir().join(format!("growth-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let account = json!({"id":"fictional-missing-account"});
+        let api = Official {
+            account: &account,
+            root: &root,
+            automatic: true,
+        };
+        assert!(api.chat().await.unwrap_err().contains("自动聊天已关闭"));
+        assert!(api.accept().await.unwrap_err().contains("自动聊天已关闭"));
+        assert!(!root.join("growth-runtime").exists());
+        assert!(!root.join("activity_operations.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     struct Fake {
         t: Mutex<GrowthTask>,
         calls: AtomicUsize,

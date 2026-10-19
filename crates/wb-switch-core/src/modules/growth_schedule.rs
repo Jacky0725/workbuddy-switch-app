@@ -41,6 +41,7 @@ impl Default for GrowthConfig {
 #[derive(Serialize)]
 pub struct ScheduleSnapshot {
     pub config: GrowthConfig,
+    pub chat_execution_enabled: bool,
     pub revision: String,
     pub running: bool,
     pub state: ScheduleState,
@@ -60,6 +61,27 @@ pub struct ScheduleState {
 pub struct SaveRequest {
     pub config: GrowthConfig,
     pub expected_revision: String,
+    pub chat_execution_enabled: Option<bool>,
+}
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatConfig {
+    version: u32,
+    enabled: bool,
+}
+fn chat_enabled(root: &Path) -> Result<bool, String> {
+    let path = root.join("growth_chat_config.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let c: ChatConfig = read(&path)?;
+    if c.version != 1 {
+        return Err("聊天执行配置版本不支持，已停止执行".into());
+    }
+    Ok(c.enabled)
+}
+fn schedule_revision(root: &Path, c: &GrowthConfig) -> Result<String, String> {
+    Ok(format!("{}:{}", revision(c), chat_enabled(root)?))
 }
 static RUNNING: AtomicBool = AtomicBool::new(false);
 fn read<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
@@ -89,10 +111,8 @@ fn validate(c: &GrowthConfig) -> Result<(), String> {
     if c.travel_depart && c.travel_location_id.is_none_or(|id| id <= 0) {
         return Err("请选择旅行目的地".into());
     }
-    if c.enabled
-        && ((!c.auto_claim && !c.travel_claim && !c.travel_depart) || c.account_ids.is_empty())
-    {
-        return Err("请选择账号及自动动作".into());
+    if c.enabled && c.account_ids.is_empty() {
+        return Err("请选择账号".into());
     }
     let unique: std::collections::BTreeSet<_> = c.account_ids.iter().collect();
     if unique.len() != c.account_ids.len() {
@@ -122,7 +142,8 @@ pub fn snapshot() -> Result<ScheduleSnapshot, String> {
 pub(crate) fn snapshot_at(root: &Path) -> Result<ScheduleSnapshot, String> {
     let c = load(root)?;
     Ok(ScheduleSnapshot {
-        revision: revision(&c),
+        revision: schedule_revision(root, &c)?,
+        chat_execution_enabled: chat_enabled(root)?,
         config: c,
         running: RUNNING.load(Ordering::Relaxed),
         state: read(&root.join("growth_schedule_state.json"))?,
@@ -140,19 +161,43 @@ pub fn save(request: SaveRequest) -> Result<ScheduleSnapshot, String> {
         .map_err(|_| "成长配置锁不可读取")?;
     lock.try_lock_exclusive().map_err(|_| "成长配置正在保存")?;
     validate(&request.config)?;
-    if revision(&load(&root)?) != request.expected_revision {
+    if schedule_revision(&root, &load(&root)?)? != request.expected_revision {
         return Err("配置已被其他窗口更新，请刷新后保存".into());
+    }
+    // Disable before changing selected accounts; enable only after the plan is
+    // saved. Readers must never see a new plan with an old enabled chat switch
+    // when this save was intended to cancel chat execution.
+    if request.chat_execution_enabled == Some(false) {
+        save_chat(&root, false)?;
     }
     durable_write(
         &root.join("growth_config.json"),
         &serde_json::to_string(&request.config).unwrap(),
     )
     .map_err(|_| "成长计划保存失败")?;
+    if request.chat_execution_enabled == Some(true) {
+        save_chat(&root, true)?;
+    }
     snapshot_at(&root)
+}
+fn save_chat(root: &Path, enabled: bool) -> Result<(), String> {
+    durable_write(
+        &root.join("growth_chat_config.json"),
+        &serde_json::to_string(&ChatConfig {
+            version: 1,
+            enabled,
+        })
+        .unwrap(),
+    )
+    .map_err(|_| "聊天执行开关保存失败，请刷新核对".into())
 }
 pub(crate) fn allows(id: &str) -> Result<bool, String> {
     let c = load(&config::store_dir())?;
     Ok(c.enabled && c.auto_claim && c.account_ids.iter().any(|v| v == id))
+}
+pub(crate) fn allows_chat(root: &Path, id: &str) -> Result<bool, String> {
+    let c = load(root)?;
+    Ok(c.enabled && chat_enabled(root)? && c.account_ids.iter().any(|v| v == id))
 }
 pub(crate) fn allows_travel(id: &str, action: &str, location: Option<i64>) -> Result<bool, String> {
     let c = load(&config::store_dir())?;
@@ -164,8 +209,8 @@ pub(crate) fn allows_travel(id: &str, action: &str, location: Option<i64>) -> Re
             _ => false,
         })
 }
-fn due(c: &GrowthConfig, s: &ScheduleState, now: i64) -> bool {
-    if !c.enabled || (!c.auto_claim && !c.travel_claim && !c.travel_depart) {
+fn due(c: &GrowthConfig, s: &ScheduleState, now: i64, chat: bool) -> bool {
+    if !c.enabled || (!c.auto_claim && !c.travel_claim && !c.travel_depart && !chat) {
         return false;
     }
     let Some(t) = FixedOffset::east_opt(8 * 3600)
@@ -179,9 +224,95 @@ fn due(c: &GrowthConfig, s: &ScheduleState, now: i64) -> bool {
         return false;
     }
     let date = t.format("%Y-%m-%d").to_string();
-    s.date != date || s.config_revision != revision(c) || s.next_retry_ms.is_some_and(|v| v <= now)
+    s.date != date
+        || s.config_revision != format!("{}:{chat}", revision(c))
+        || s.next_retry_ms.is_some_and(|v| v <= now)
+}
+async fn execute_batch(
+    root: &Path,
+    c: GrowthConfig,
+    chat: bool,
+) -> Result<growth_automation::RunReport, String> {
+    let mut chat_pending = 0;
+    let mut chat_errors = Vec::new();
+    let mut chat_halted = false;
+    // Reconcile even when disabled, but never send a prompt with zero budget.
+    for id in &c.account_ids {
+        let pending = growth_automation::read_journal(root)?
+            .operations
+            .values()
+            .any(|op| {
+                op.account_id == *id
+                    && op.task_code.starts_with("chat_5/")
+                    && op.state == growth_automation::OperationState::AwaitingVerification
+            });
+        if !chat && !pending {
+            continue;
+        }
+        let budget = if allows_chat(root, id)? { 5 } else { 0 };
+        match super::growth_execution::run_locked(root, id, budget, true).await {
+            Ok(r) => {
+                chat_pending += usize::from(r.awaiting_verification);
+                if r.halted {
+                    chat_halted = true;
+                    chat_errors.push("聊天执行已暂停，请查看操作记录".into());
+                    break;
+                }
+            }
+            Err(e) => chat_errors.push(e),
+        }
+    }
+    let mut total = if c.auto_claim && !chat_halted {
+        growth_automation::run_claims_locked(root, None, Some(&c.account_ids)).await?
+    } else {
+        growth_automation::RunReport::default()
+    };
+    total.halted |= chat_halted;
+    total.awaiting_verification += chat_pending;
+    total.errors.extend(chat_errors);
+    if !total.halted && (c.travel_claim || c.travel_depart) {
+        for a in super::account::try_load_accounts()
+            .map_err(|_| "账号库不可读取")?
+            .iter()
+            .filter(|a| c.account_ids.iter().any(|id| a["id"] == *id))
+        {
+            match super::growth_travel::run_locked(
+                root,
+                a,
+                c.travel_claim,
+                if c.travel_depart {
+                    c.travel_location_id
+                } else {
+                    None
+                },
+                true,
+            )
+            .await
+            {
+                Ok(r) => {
+                    total.verified += r.verified;
+                    total.waiting += r.waiting;
+                    total.awaiting_verification += r.awaiting_verification;
+                    total.errors.extend(r.errors);
+                    if r.halted || r.awaiting_verification > 0 {
+                        total.halted = true;
+                        break;
+                    }
+                }
+                Err(e) => total.errors.push(e),
+            }
+        }
+    }
+    Ok::<_, String>(total)
 }
 async fn run_due(root: &Path, now: i64) -> Result<(), String> {
+    run_due_with(root, now, |c, chat| execute_batch(root, c, chat)).await
+}
+async fn run_due_with<F, Fut>(root: &Path, now: i64, execute: F) -> Result<(), String>
+where
+    F: FnOnce(GrowthConfig, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<growth_automation::RunReport, String>>,
+{
     std::fs::create_dir_all(root.join("locks")).map_err(|_| "成长锁目录不可创建")?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -195,7 +326,8 @@ async fn run_due(root: &Path, now: i64) -> Result<(), String> {
     }
     let c = load(root)?;
     let mut s: ScheduleState = read(&root.join("growth_schedule_state.json"))?;
-    if !due(&c, &s, now) {
+    let chat = chat_enabled(root)?;
+    if !due(&c, &s, now, chat) {
         return Ok(());
     }
     s.date = FixedOffset::east_opt(8 * 3600)
@@ -208,7 +340,7 @@ async fn run_due(root: &Path, now: i64) -> Result<(), String> {
     s.finished_ms = None;
     s.next_retry_ms = Some(now + 15 * 60 * 1000);
     s.error = None;
-    s.config_revision = revision(&c);
+    s.config_revision = schedule_revision(root, &c)?;
     let persist = |s: &ScheduleState| {
         durable_write(
             &root.join("growth_schedule_state.json"),
@@ -217,48 +349,7 @@ async fn run_due(root: &Path, now: i64) -> Result<(), String> {
         .map_err(|_| "成长运行状态保存失败".to_string())
     };
     persist(&s)?;
-    let result = async {
-        let mut total = if c.auto_claim {
-            growth_automation::run_claims_locked(root, None, Some(&c.account_ids)).await?
-        } else {
-            growth_automation::RunReport::default()
-        };
-        if !total.halted && (c.travel_claim || c.travel_depart) {
-            for a in super::account::try_load_accounts()
-                .map_err(|_| "账号库不可读取")?
-                .iter()
-                .filter(|a| c.account_ids.iter().any(|id| a["id"] == *id))
-            {
-                match super::growth_travel::run_locked(
-                    root,
-                    a,
-                    c.travel_claim,
-                    if c.travel_depart {
-                        c.travel_location_id
-                    } else {
-                        None
-                    },
-                    true,
-                )
-                .await
-                {
-                    Ok(r) => {
-                        total.verified += r.verified;
-                        total.waiting += r.waiting;
-                        total.awaiting_verification += r.awaiting_verification;
-                        total.errors.extend(r.errors);
-                        if r.halted || r.awaiting_verification > 0 {
-                            total.halted = true;
-                            break;
-                        }
-                    }
-                    Err(e) => total.errors.push(e),
-                }
-            }
-        }
-        Ok::<_, String>(total)
-    }
-    .await;
+    let result = execute(c, chat).await;
     match result {
         Ok(r) => {
             s.finished_ms = Some(config::now_ms());
@@ -296,13 +387,13 @@ pub fn dispatch() {
         let result: Result<bool, String> = (|| {
             let c = load(&root)?;
             let s = read(&root.join("growth_schedule_state.json"))?;
-            Ok(due(&c, &s, config::now_ms()))
+            Ok(due(&c, &s, config::now_ms(), chat_enabled(&root)?))
         })();
         if matches!(result, Ok(true)) {
             if run_due(&root, config::now_ms()).await.is_err() {
                 eprintln!("[成长任务] 配置或运行记录不可读取，已暂停本批次");
             } else if let Ok(c) = load(&root) {
-                if c.enabled && c.auto_claim {
+                if c.enabled {
                     // The batch has released the shared lock. Refresh the display cache
                     // from official state rather than leaving old completed rows visible.
                     for id in c.account_ids {
@@ -316,6 +407,156 @@ pub fn dispatch() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("growth-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    #[tokio::test]
+    async fn scheduled_worker_runs_once_and_shared_lock_prevents_second_batch() {
+        let root = fixture();
+        let c = GrowthConfig {
+            enabled: true,
+            account_ids: vec!["fictional".into()],
+            ..Default::default()
+        };
+        std::fs::write(
+            root.join("growth_config.json"),
+            serde_json::to_vec(&c).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("growth_chat_config.json"),
+            r#"{"version":1,"enabled":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("daily_scheduler_state.json"),
+            "unchanged-signin-fixture",
+        )
+        .unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-19T10:00:00+08:00")
+            .unwrap()
+            .timestamp_millis();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        for time in [now - 3_600_000, now, now + 60_000] {
+            run_due_with(&root, time, |_, chat| {
+                assert!(chat);
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(growth_automation::RunReport::default()))
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("daily_scheduler_state.json")).unwrap(),
+            "unchanged-signin-fixture"
+        );
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("locks/growth.lock"))
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        run_due_with(&root, now + 86_400_000, |_, _| {
+            panic!("second worker must not run");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(growth_automation::RunReport::default()))
+        })
+        .await
+        .unwrap();
+        drop(lock);
+        std::fs::write(
+            root.join("growth_chat_config.json"),
+            r#"{"version":1,"enabled":false}"#,
+        )
+        .unwrap();
+        run_due_with(&root, now + 86_400_000, |_, _| {
+            panic!("disabled worker must not run");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(growth_automation::RunReport::default()))
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn upgrade_defaults_off_and_cancellation_rechecks_accounts_and_switch() {
+        let root = fixture();
+        let mut c = GrowthConfig {
+            enabled: true,
+            account_ids: vec!["a".into()],
+            ..Default::default()
+        };
+        let original = serde_json::to_vec(&c).unwrap();
+        std::fs::write(root.join("growth_config.json"), &original).unwrap();
+        assert!(!snapshot_at(&root).unwrap().chat_execution_enabled);
+        assert!(!allows_chat(&root, "a").unwrap());
+        std::fs::write(
+            root.join("growth_chat_config.json"),
+            r#"{"version":1,"enabled":true}"#,
+        )
+        .unwrap();
+        assert!(allows_chat(&root, "a").unwrap());
+        assert!(!allows_chat(&root, "removed").unwrap());
+        assert_eq!(
+            std::fs::read(root.join("growth_config.json")).unwrap(),
+            original
+        );
+        c.enabled = false;
+        std::fs::write(
+            root.join("growth_config.json"),
+            serde_json::to_vec(&c).unwrap(),
+        )
+        .unwrap();
+        assert!(!allows_chat(&root, "a").unwrap());
+        std::fs::write(
+            root.join("growth_chat_config.json"),
+            r#"{"version":1,"enabled":false}"#,
+        )
+        .unwrap();
+        assert!(!allows_chat(&root, "a").unwrap());
+        std::fs::write(root.join("growth_chat_config.json"), "broken").unwrap();
+        c.enabled = true;
+        std::fs::write(
+            root.join("growth_config.json"),
+            serde_json::to_vec(&c).unwrap(),
+        )
+        .unwrap();
+        assert!(allows_chat(&root, "a").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn chat_only_schedule_is_due_once_then_survives_restart_and_toggle() {
+        let root = fixture();
+        let c = GrowthConfig {
+            enabled: true,
+            account_ids: vec!["a".into()],
+            ..Default::default()
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-19T10:00:00+08:00")
+            .unwrap()
+            .timestamp_millis();
+        assert!(!due(&c, &ScheduleState::default(), now, false));
+        assert!(due(&c, &ScheduleState::default(), now, true));
+        let s = ScheduleState {
+            date: "2026-10-19".into(),
+            config_revision: format!("{}:true", revision(&c)),
+            ..Default::default()
+        };
+        std::fs::write(
+            root.join("growth_schedule_state.json"),
+            serde_json::to_vec(&s).unwrap(),
+        )
+        .unwrap();
+        let restored: ScheduleState = read(&root.join("growth_schedule_state.json")).unwrap();
+        assert!(!due(&c, &restored, now + 60_000, true));
+        assert!(!due(&c, &restored, now - 60_000, true));
+        assert!(due(&c, &restored, now + 86_400_000, true));
+        assert!(!due(&c, &restored, now, false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn defaults_do_not_submit_and_catch_up_only_today() {
         let mut c = GrowthConfig::default();
@@ -323,18 +564,18 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-15T10:00:00+08:00")
             .unwrap()
             .timestamp_millis();
-        assert!(!due(&c, &s, now));
+        assert!(!due(&c, &s, now, false));
         c.enabled = true;
         c.auto_claim = true;
         c.account_ids = vec!["a".into()];
-        assert!(due(&c, &s, now));
+        assert!(due(&c, &s, now, false));
         s.date = "2026-10-15".into();
-        s.config_revision = revision(&c);
-        assert!(!due(&c, &s, now));
+        s.config_revision = format!("{}:false", revision(&c));
+        assert!(!due(&c, &s, now, false));
         s.next_retry_ms = Some(now + 900_000);
-        assert!(!due(&c, &s, now));
-        assert!(due(&c, &s, now + 900_000));
-        assert!(!due(&c, &ScheduleState::default(), now - 3_600_000));
+        assert!(!due(&c, &s, now, false));
+        assert!(due(&c, &s, now + 900_000, false));
+        assert!(!due(&c, &ScheduleState::default(), now - 3_600_000, false));
     }
     #[test]
     fn invalid_times_and_unknown_versions_fail_closed() {

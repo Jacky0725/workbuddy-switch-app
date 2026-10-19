@@ -304,7 +304,7 @@ export function getGrowthOperations(): Promise<import("./types").GrowthOperation
 export function getGrowthSchedule(): Promise<import("./types").GrowthSchedule> { return call("get_growth_schedule"); }
 export function refreshGrowthTravel(accountId:string): Promise<import("./types").GrowthTravel> {return call("refresh_growth_travel",{accountId});}
 export function runGrowthTravel(accountId:string,claim:boolean,departLocationId?:number): Promise<import("./types").GrowthRunReport> {return call("run_growth_travel",{accountId,claim,departLocationId});}
-export function saveGrowthSchedule(config: import("./types").GrowthConfig, expectedRevision: string): Promise<import("./types").GrowthSchedule> { return call("save_growth_schedule", { request: { config, expected_revision: expectedRevision } }); }
+export function saveGrowthSchedule(config: import("./types").GrowthConfig, expectedRevision: string, chatExecutionEnabled?: boolean): Promise<import("./types").GrowthSchedule> { return call("save_growth_schedule", { request: { config, expected_revision: expectedRevision, chat_execution_enabled: chatExecutionEnabled } }); }
 export function saveManagerScheduler(config: ManagerSchedulerConfig, expectedRevision: string): Promise<ManagerSchedulerSnapshot> {
   return call("save_manager_scheduler", { request: { config, expected_revision: expectedRevision } });
 }
