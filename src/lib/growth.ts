@@ -1,5 +1,12 @@
 import type { GrowthTask } from "./types";
 
+export function growthTaskProgress(task: GrowthTask): string {
+  if (task.current === null && task.target === null) {
+    return task.accept_status === "not_accepted" ? "尚未接受／暂无进度" : "暂无进度";
+  }
+  return `${task.current ?? "未知"} / ${task.target ?? "未知"}`;
+}
+
 export function growthTaskStatus(task: GrowthTask, now = Date.now()): string {
   if (task.valid_end_ms !== null && task.valid_end_ms <= now) return "活动已结束";
   if (task.valid_start_ms !== null && task.valid_start_ms > now) return "尚未开始";

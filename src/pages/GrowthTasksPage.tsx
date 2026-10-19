@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import * as api from "@/lib/api";
 import type { AccountMeta, GrowthSnapshot, GrowthOperation, GrowthSchedule, GrowthTravel, ManagerSchedulerSnapshot } from "@/lib/types";
 import { beijingTime } from "@/lib/manager-scheduler";
-import { growthTaskStatus } from "@/lib/growth";
+import { growthTaskProgress, growthTaskStatus } from "@/lib/growth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -121,7 +121,7 @@ export default function GrowthTasksPage() {
         {row.error && <p className="mb-3 text-sm text-destructive">{row.error}</p>}
         {!row.tasks.length ? <p className="text-sm text-muted-foreground">{row.observed_at_ms === null ? "尚无查询结果" : "官方未返回任务"}</p> : <div className="overflow-x-auto"><table className="w-full text-left text-sm">
           <thead><tr className="border-b"><th className="p-2">任务</th><th className="p-2">进度</th><th className="p-2">状态</th><th className="p-2">有效期至</th></tr></thead>
-          <tbody>{row.tasks.map(t => <tr key={t.code} className="border-b"><td className="p-2">{t.title}</td><td className="p-2">{t.current ?? "未知"} / {t.target ?? "未知"}</td><td className="p-2">{growthTaskStatus(t)}</td><td className="p-2">{beijingTime(t.valid_end_ms)}</td></tr>)}</tbody>
+          <tbody>{row.tasks.map(t => <tr key={t.code} className="border-b"><td className="p-2">{t.title}</td><td className="p-2">{growthTaskProgress(t)}</td><td className="p-2">{growthTaskStatus(t)}</td><td className="p-2">{beijingTime(t.valid_end_ms)}</td></tr>)}</tbody>
         </table></div>}
       </CardContent></Card>;
     })}
