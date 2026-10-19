@@ -222,10 +222,24 @@ async fn drive(
             verify(root, &mut j, &claim_key)?;
         }
     }
-    if j.operations
-        .values()
-        .any(|op| op.state == OperationState::AwaitingVerification)
-    {
+    if j.operations.values().any(|op| {
+        if op.state != OperationState::AwaitingVerification {
+            return false;
+        }
+        // A completed official prompt with delayed progress pauses its own
+        // account. Rejection/unknown runtime results and other writes still
+        // block the batch; changing accounts must never retry those actions.
+        let acknowledged_chat = matches!(
+            op.task_code.as_str(),
+            "chat_5/execute/0"
+                | "chat_5/execute/1"
+                | "chat_5/execute/2"
+                | "chat_5/execute/3"
+                | "chat_5/execute/4"
+        ) && op.submission_acknowledged == Some(true)
+            && op.error.as_deref() == Some("等待官方进度核实，禁止重发");
+        op.account_id == a["id"].as_str().unwrap_or("") || !acknowledged_chat
+    }) {
         report.awaiting_verification = true;
         return Ok(report);
     }
@@ -463,6 +477,27 @@ mod tests {
         assert!(r.accepted);
         assert_eq!(r.actions_verified, 1);
         assert!(r.budget_exhausted);
+        assert_eq!(api.calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn other_accounts_acknowledged_chat_does_not_block_but_unknown_result_does() {
+        let (root, a, api) = setup();
+        let other = json!({"id":"other","uid":"other-fictional"});
+        let t = api.t.lock().unwrap().clone();
+        let mut journal = growth_automation::read_journal(&root).unwrap();
+        let k = mark(&root, &mut journal, &other, &t, "execute/3").unwrap();
+        acknowledge(&root, &mut journal, &k, Ok(())).unwrap();
+        let r = drive(&root, &a, &api, 1).await.unwrap();
+        assert_eq!(r.actions_verified, 1);
+        let mut journal = growth_automation::read_journal(&root).unwrap();
+        assert_eq!(
+            journal.operations[&k].state,
+            OperationState::AwaitingVerification
+        );
+        acknowledge(&root, &mut journal, &k, Err("unknown result".into())).unwrap();
+        let r = drive(&root, &a, &api, 1).await.unwrap();
+        assert!(r.awaiting_verification);
         assert_eq!(api.calls.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(root).unwrap();
     }

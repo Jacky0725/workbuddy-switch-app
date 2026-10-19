@@ -14,7 +14,11 @@ use std::{
 };
 
 #[cfg(target_os = "windows")]
-const BUNDLE_HASH: &str = "1b1a01bc5f7b1121931b594770167ec6738b73b90b9d7d934d9aa9cab79db433";
+const BUNDLE_HASHES: &[&str] = &[
+    // Official Windows 5.8.2 and 5.8.3; protocol preflight is also required.
+    "1b1a01bc5f7b1121931b594770167ec6738b73b90b9d7d934d9aa9cab79db433",
+    "92899eb4b9d9403a95ceae17dc95e6816bb28dd9fe099790240b5b54d1dac330",
+];
 const BRIDGE: &str = include_str!("growth_acp.cjs");
 #[derive(Deserialize)]
 struct Reply {
@@ -30,7 +34,7 @@ struct Reply {
 }
 pub(crate) fn compatible() -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
     #[cfg(not(target_os = "windows"))]
-    return Err("真实成长任务目前仅验证 Windows WorkBuddy 5.8.2".into());
+    return Err("真实成长任务目前仅验证 Windows WorkBuddy 5.8.2/5.8.3".into());
     #[cfg(target_os = "windows")]
     {
         let exe = process::windows_workbuddy_exe_path(WbVariant::Cn).ok_or("未找到官方客户端")?;
@@ -67,7 +71,7 @@ pub(crate) fn compatible() -> Result<(std::path::PathBuf, std::path::PathBuf), S
             "{:x}",
             Sha256::digest(std::fs::read(&bundle).map_err(|_| "官方运行时不可读取")?)
         );
-        if digest != BUNDLE_HASH {
+        if !BUNDLE_HASHES.contains(&digest.as_str()) {
             return Err("此官方客户端运行时尚未验证，禁止自动发送对话".into());
         }
         Ok((exe, cli.join("bin/codebuddy")))
