@@ -72,7 +72,7 @@ impl Api for Official<'_> {
                 .build()
                 .map_err(|_| "接受任务连接不可创建")?;
             let mut request = client
-                .post("https://copilot.tencent.com/v2/activity/growth/tasks/accept")
+                .post("https://www.workbuddy.cn/activity/growth/tasks/accept")
                 .header("Origin", "https://www.workbuddy.cn")
                 .header("Referer", "https://www.workbuddy.cn/profile/growth-center")
                 .header("X-Client-Platform", "web")

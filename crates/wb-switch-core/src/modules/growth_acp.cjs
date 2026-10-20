@@ -76,6 +76,6 @@ process.stdin.on('data',chunk=>{
    }
   }
  });
- send(1,'initialize',{protocolVersion:1,clientInfo:{name:'WorkBuddyManager',version:'0.2.0-alpha.10'},
+ send(1,'initialize',{protocolVersion:1,clientInfo:{name:'WorkBuddyManager',version:'0.2.0-alpha.11'},
   clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}});
 });
