@@ -19,13 +19,14 @@ pub fn require_verified_client() -> Result<(), String> {
 const VERIFIED_CN_EXE_SHA256: &[&str] = &[
     "b2877bdde11794652c93dc81625ef3ae6befa77a321463039e101956e470de22", // 5.8.1
     "ffbcf6d43caed2868ce876948bf63e78fa244109282681fb6a1f9f534d717552", // 5.8.2
+    "5ea5d8ba6f6a435c27c239115647886a9646f76ff5a721e82f84f0ff16ac5e15", // 5.8.3; unchanged verified schemas
 ];
 const VERIFIED_CN_SESSION_SCHEMA_SHA256: &str =
     "58f169b7f8ae860d7dd7c31424ae2e43d3a2980b79df5ddff40bc5d2f9a3b5ae";
 const VERIFIED_CN_EDGE_SCHEMA_SHA256: &str =
     "5abcbbd5319851cd637d7e08002f546dd4041d08edc00b33d4a3dc99d9f060fd";
 
-/// Matches only the observed WorkBuddy CN 5.8.1/5.8.2 local-session candidates.
+/// Matches the observed WorkBuddy CN 5.8.1–5.8.3 local-session candidates.
 /// This structural check is not a completed live write/read acceptance test.
 /// Row and body checks still reject unsupported references.
 pub fn require_verified_local_client(variant: WbVariant) -> Result<(), String> {
