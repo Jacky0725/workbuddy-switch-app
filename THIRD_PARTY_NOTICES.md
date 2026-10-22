@@ -1,6 +1,6 @@
 # WorkBuddy Manager — Third-party notices
 
-Version 0.2.0-alpha.1. This is an independent experimental fork, with no service-provider endorsement.
+This is an independent experimental fork, with no service-provider endorsement. The inventory below retains its baseline package versions; this notice was updated on 2026-10-22.
 
 Copyright and full permission notices are retained in the accompanying `licenses/` directory and root `LICENSE`.
 Source: workbuddy-switch v0.1.58, commit 9eb3f2a21ff3c3c85fef2f89e693c48792050ba1 (MIT, Copyright (c) 2026 wb-switch).
@@ -10,7 +10,7 @@ The original geometric WM product/tray artwork is created for this fork. Third-p
 The Bricolage Grotesque font uses OFL-1.1; its full license is retained. Lucide React uses ISC.
 MPL-2.0 crate corresponding source is retained under each crate’s `corresponding-source/` directory, unmodified.
 The upstream indexmap 1.9.3 build-script patch is retained in project source (`vendor-patched/indexmap`), with its MIT/Apache notices.
-react-remove-scroll-bar 2.3.8 has no license text in its installed package. Its author’s repository license is retained from commit 8ca9ba5ea52de03308fe8ced94f7b159a44d28ff, whose package version is 2.3.7. Exact release-source correspondence is NOT verified; public distribution remains pending this check.
+react-remove-scroll-bar 2.3.8 declares MIT in its integrity-verified npm release. All 26 non-manifest files are byte-identical to the official 2.3.7 release; only the version and react-style-singleton dependency range differ. The upstream change from the 2.3.7 release commit to 8ca9ba5ea52de03308fe8ced94f7b159a44d28ff only adds the retained MIT LICENSE. This verifies the published code payload’s license correspondence without claiming access to the unavailable 2.3.8 gitHead or a reproducible source build. See [provenance](licenses/npm/react-remove-scroll-bar-2.3.8/PROVENANCE.json).
 This inventory intentionally includes build dependencies; it is not a symbol-level binary linkage report.
 
 | Ecosystem | Package | Version | License | Full text |
