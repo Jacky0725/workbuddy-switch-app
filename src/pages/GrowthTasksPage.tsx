@@ -49,11 +49,21 @@ export default function GrowthTasksPage() {
   }
   async function savePlan() {
     if (!plan || busy) return;
-    setBusy(true); setError(null);
+    setError(null); setMessage(null);
+    if (plan.config.travel_depart && !plan.config.travel_location_id) {
+      setError("启用每日自动出发前，请在下方选择一个账号，点击“查询旅行”，再选择目的地。");
+      return;
+    }
+    setBusy(true);
     try {
       const saved = await api.saveGrowthSchedule(plan.config, plan.revision, plan.chat_execution_enabled);
-      const next = await api.getGrowthTasks();
-      if (mounted.current) { setPlan(saved); setData(next); setMessage("成长计划已保存。电脑唤醒且程序运行时，按北京时间处理当天任务。"); }
+      if (mounted.current) { setPlan(saved); setMessage("成长计划已保存。电脑唤醒且程序运行时，按北京时间处理当天任务。"); }
+      try {
+        const next = await api.getGrowthTasks();
+        if (mounted.current) setData(next);
+      } catch (cause) {
+        if (mounted.current) setMessage(`成长计划已保存，但状态刷新失败：${api.asError(cause)}`);
+      }
     } catch(cause) { if (mounted.current) setError(api.asError(cause)); }
     finally { if (mounted.current) setBusy(false); }
   }
@@ -84,6 +94,7 @@ export default function GrowthTasksPage() {
       <label className="flex gap-2"><input type="checkbox" checked={plan.config.auto_claim} disabled={busy} onChange={e => setPlan({...plan, config:{...plan.config, auto_claim:e.target.checked}})} />自动领取已完成的普通任务奖励</label>
       <label className="flex gap-2"><input type="checkbox" checked={plan.config.travel_claim} disabled={busy} onChange={e => setPlan({...plan, config:{...plan.config, travel_claim:e.target.checked}})} />旅行到达后自动领取</label>
       <label className="flex gap-2"><input type="checkbox" checked={plan.config.travel_depart} disabled={busy} onChange={e => setPlan({...plan, config:{...plan.config, travel_depart:e.target.checked}})} />每日自动出发（先查询账号旅行状态并选择下方目的地）</label>
+      {plan.config.travel_depart && <p className="text-muted-foreground">{plan.config.travel_location_id ? "已选择旅行目的地。" : "请先在下方选择单个账号、查询旅行，然后选择目的地；所有计划账号使用同一目的地。"}</p>}
       <label className="flex items-center gap-2">北京时间 <input type="time" value={plan.config.daily_time} disabled={busy} onChange={e => setPlan({...plan,config:{...plan.config,daily_time:e.target.value}})} className="rounded border bg-background p-1" /></label>
       <div className="flex flex-wrap gap-4">{accounts.map(a => <label key={a.id} className="flex gap-2"><input type="checkbox" checked={plan.config.account_ids.includes(a.id)} disabled={busy} onChange={e => setPlan({...plan,config:{...plan.config,account_ids:e.target.checked ? [...plan.config.account_ids,a.id] : plan.config.account_ids.filter(id=>id!==a.id)}})} />{a.note || a.nickname || a.id}</label>)}</div>
       <p className="text-muted-foreground">以上勾选的账号参与计划。聊天开关开启后，仅对符合条件的“五次对话”任务自动接受并补足剩余进度，每账号每次最多 5 条虚构对话，可能消耗模型额度；同时开启普通奖励领取才能在达标后自动领奖。技能和资料库仅支持领取已完成奖励。遇待核实操作会停止后续提交，先核对官方状态。</p>
@@ -93,6 +104,8 @@ export default function GrowthTasksPage() {
       {plan.config.enabled && !plan.config.auto_claim && <p>普通奖励自动领取已关闭；完成任务后需手动领取，或开启并保存自动领取。</p>}
       <p>最近开始：{beijingTime(plan.state.last_started_ms)} · 完成：{beijingTime(plan.state.finished_ms)}</p>
       {plan.state.error && <p className="text-destructive">{plan.state.error}</p>}
+      {error && <p role="alert" className="text-destructive">{error}</p>}
+      {message && <p role="status">{message}</p>}
       <Button disabled={busy} onClick={() => void savePlan()}>保存成长计划</Button>
     </CardContent></Card>}
     <div className="flex flex-wrap items-center gap-3"><label htmlFor="growth-account">查询账号</label>
