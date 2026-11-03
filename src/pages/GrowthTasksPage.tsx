@@ -86,7 +86,11 @@ export default function GrowthTasksPage() {
       <label className="flex gap-2"><input type="checkbox" checked={plan.config.travel_depart} disabled={busy} onChange={e => setPlan({...plan, config:{...plan.config, travel_depart:e.target.checked}})} />每日自动出发（先查询账号旅行状态并选择下方目的地）</label>
       <label className="flex items-center gap-2">北京时间 <input type="time" value={plan.config.daily_time} disabled={busy} onChange={e => setPlan({...plan,config:{...plan.config,daily_time:e.target.value}})} className="rounded border bg-background p-1" /></label>
       <div className="flex flex-wrap gap-4">{accounts.map(a => <label key={a.id} className="flex gap-2"><input type="checkbox" checked={plan.config.account_ids.includes(a.id)} disabled={busy} onChange={e => setPlan({...plan,config:{...plan.config,account_ids:e.target.checked ? [...plan.config.account_ids,a.id] : plan.config.account_ids.filter(id=>id!==a.id)}})} />{a.note || a.nickname || a.id}</label>)}</div>
-      <p className="text-muted-foreground">聊天执行默认关闭。启用后仅补足五次对话任务的剩余进度，每账号每次最多 5 条虚构对话；结果待核实时暂停该账号。勾选自动领取后，达标再领奖。关闭开关会停止后续动作，已发送的请求仍会核实。技能和资料库任务不会自动执行。</p>
+      <p className="text-muted-foreground">以上勾选的账号参与计划。聊天开关开启后，仅对符合条件的“五次对话”任务自动接受并补足剩余进度，每账号每次最多 5 条虚构对话，可能消耗模型额度；同时开启普通奖励领取才能在达标后自动领奖。技能和资料库仅支持领取已完成奖励。遇待核实操作会停止后续提交，先核对官方状态。</p>
+      {!plan.config.enabled && <p>成长计划已关闭；开启并保存后才会定时处理所选账号。</p>}
+      {plan.config.enabled && plan.config.account_ids.length === 0 && <p>尚未选择计划账号，请选择账号并保存。</p>}
+      {plan.config.enabled && !plan.chat_execution_enabled && <p>聊天任务自动执行已关闭；开启并保存后才会自动接受和完成符合条件的聊天任务。</p>}
+      {plan.config.enabled && !plan.config.auto_claim && <p>普通奖励自动领取已关闭；完成任务后需手动领取，或开启并保存自动领取。</p>}
       <p>最近开始：{beijingTime(plan.state.last_started_ms)} · 完成：{beijingTime(plan.state.finished_ms)}</p>
       {plan.state.error && <p className="text-destructive">{plan.state.error}</p>}
       <Button disabled={busy} onClick={() => void savePlan()}>保存成长计划</Button>
@@ -120,8 +124,8 @@ export default function GrowthTasksPage() {
       </CardHeader><CardContent>
         {row.error && <p className="mb-3 text-sm text-destructive">{row.error}</p>}
         {!row.tasks.length ? <p className="text-sm text-muted-foreground">{row.observed_at_ms === null ? "尚无查询结果" : "官方未返回任务"}</p> : <div className="overflow-x-auto"><table className="w-full text-left text-sm">
-          <thead><tr className="border-b"><th className="p-2">任务</th><th className="p-2">进度</th><th className="p-2">状态</th><th className="p-2">有效期至</th></tr></thead>
-          <tbody>{row.tasks.map(t => <tr key={t.code} className="border-b"><td className="p-2">{t.title}</td><td className="p-2">{growthTaskProgress(t)}</td><td className="p-2">{growthTaskStatus(t)}</td><td className="p-2">{beijingTime(t.valid_end_ms)}</td></tr>)}</tbody>
+          <thead><tr className="border-b"><th className="p-2">任务</th><th className="p-2">处理方式</th><th className="p-2">进度</th><th className="p-2">状态</th><th className="p-2">有效期至</th></tr></thead>
+          <tbody>{row.tasks.map(t => <tr key={t.code} className="border-b"><td className="p-2">{t.title}</td><td className="p-2">{t.code === "chat_5" ? "可自动完成并领奖" : t.code === "skill_1" || t.code === "Library_read" ? "仅自动领奖" : "需手动完成"}</td><td className="p-2">{growthTaskProgress(t)}</td><td className="p-2">{growthTaskStatus(t)}</td><td className="p-2">{beijingTime(t.valid_end_ms)}</td></tr>)}</tbody>
         </table></div>}
       </CardContent></Card>;
     })}
