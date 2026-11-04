@@ -108,7 +108,7 @@ fn validate(c: &GrowthConfig) -> Result<(), String> {
     {
         return Err("成长计划配置无效".into());
     }
-    if c.travel_depart && c.travel_location_id.is_none_or(|id| id <= 0) {
+    if c.travel_depart && c.travel_location_id.is_none_or(|id| id < 0) {
         return Err("请选择旅行目的地".into());
     }
     if c.enabled && c.account_ids.is_empty() {
@@ -199,8 +199,13 @@ pub(crate) fn allows_chat(root: &Path, id: &str) -> Result<bool, String> {
     let c = load(root)?;
     Ok(c.enabled && chat_enabled(root)? && c.account_ids.iter().any(|v| v == id))
 }
-pub(crate) fn allows_travel(id: &str, action: &str, location: Option<i64>) -> Result<bool, String> {
-    let c = load(&config::store_dir())?;
+pub(crate) fn allows_travel_at(
+    root: &Path,
+    id: &str,
+    action: &str,
+    location: Option<i64>,
+) -> Result<bool, String> {
+    let c = load(root)?;
     Ok(c.enabled
         && c.account_ids.iter().any(|v| v == id)
         && match action {
@@ -293,13 +298,21 @@ async fn execute_batch(
                     total.verified += r.verified;
                     total.waiting += r.waiting;
                     total.awaiting_verification += r.awaiting_verification;
-                    total.errors.extend(r.errors);
+                    total.errors.extend(
+                        r.errors
+                            .into_iter()
+                            .map(|e| format!("{}：{}", super::account::account_display_name(a), e)),
+                    );
                     if r.halted || r.awaiting_verification > 0 {
                         total.halted = true;
                         break;
                     }
                 }
-                Err(e) => total.errors.push(e),
+                Err(e) => total.errors.push(format!(
+                    "{}：{}",
+                    super::account::account_display_name(a),
+                    e
+                )),
             }
         }
     }
@@ -357,9 +370,13 @@ where
                 s.next_retry_ms = None;
             } else if !r.errors.is_empty() || r.awaiting_verification > 0 {
                 s.error = Some(format!(
-                    "待核实 {} 项；查询异常 {} 项",
+                    "待核实 {} 项；查询异常 {} 项{}",
                     r.awaiting_verification,
-                    r.errors.len()
+                    r.errors.len(),
+                    r.errors
+                        .first()
+                        .map(|e| format!("：{}", e))
+                        .unwrap_or_default()
                 ));
             }
         }

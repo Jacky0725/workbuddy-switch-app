@@ -136,10 +136,9 @@ async fn locations(a: &Value) -> Result<(bool, Vec<Location>), String> {
         .ok_or("旅行目的地列表无效")?;
     let mut result = vec![];
     for row in rows {
-        let id = row["id"]
-            .as_i64()
-            .filter(|id| *id > 0)
-            .ok_or("旅行目的地无效")?;
+        let Some(id) = row["id"].as_i64().filter(|id| *id > 0) else {
+            continue;
+        };
         let name = row["name"]
             .as_str()
             .unwrap_or("")
@@ -209,6 +208,15 @@ fn verified(op: &ActivityOperation, s: &TravelState) -> bool {
         && s.location_id == location
         && depart_ms.is_some_and(|v| v >= op.submitted_at_ms - 30_000)
 }
+fn random_location(choices: &[Location]) -> Option<i64> {
+    let mut ids: Vec<i64> = choices.iter().map(|l| l.id).filter(|id| *id > 0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return None;
+    }
+    Some(ids[(uuid::Uuid::new_v4().as_u128() % ids.len() as u128) as usize])
+}
 fn business_date(ms: i64) -> String {
     use chrono::TimeZone;
     chrono::FixedOffset::east_opt(8 * 3600)
@@ -225,6 +233,25 @@ fn belongs(k: &str, a: &Value, op: &ActivityOperation) -> bool {
     op.task_code.starts_with("travel_depart:")
         && k == key(a, "depart", &business_date(op.submitted_at_ms))
 }
+type TravelFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send + 'a>>;
+trait TravelApi: Sync {
+    fn status(&self) -> TravelFuture<'_, TravelState>;
+    fn locations(&self) -> TravelFuture<'_, (bool, Vec<Location>)>;
+    fn submit<'a>(&'a self, action: &'a str, body: Value) -> TravelFuture<'a, ()>;
+}
+struct OfficialTravel<'a>(&'a Value);
+impl TravelApi for OfficialTravel<'_> {
+    fn status(&self) -> TravelFuture<'_, TravelState> {
+        Box::pin(status(self.0))
+    }
+    fn locations(&self) -> TravelFuture<'_, (bool, Vec<Location>)> {
+        Box::pin(locations(self.0))
+    }
+    fn submit<'a>(&'a self, action: &'a str, body: Value) -> TravelFuture<'a, ()> {
+        Box::pin(async move { request(self.0, action, Some(body)).await.map(|_| ()) })
+    }
+}
 pub(crate) async fn run_locked(
     root: &Path,
     a: &Value,
@@ -233,11 +260,28 @@ pub(crate) async fn run_locked(
     automatic: bool,
 ) -> Result<RunReport, String> {
     let prepared = growth::prepare_account(a).await;
-    let a = &prepared;
+    run_with(
+        root,
+        &prepared,
+        claim,
+        depart,
+        automatic,
+        &OfficialTravel(&prepared),
+    )
+    .await
+}
+async fn run_with(
+    root: &Path,
+    a: &Value,
+    claim: bool,
+    depart: Option<i64>,
+    automatic: bool,
+    api: &impl TravelApi,
+) -> Result<RunReport, String> {
     let mut report = RunReport::default();
     let mut journal = growth_automation::read_journal(root)?;
     let id = a["id"].as_str().ok_or("账号标识缺失")?;
-    let s = status(a).await?;
+    let s = api.status().await?;
     // Resolve previous unknown outcomes before any new submission.
     let mut changed = false;
     for (_, op) in journal.operations.iter_mut().filter(|(k, o)| {
@@ -274,12 +318,34 @@ pub(crate) async fn run_locked(
             json!({"record_id":record}),
         )
     } else if s.state == "idle" && !s.daily_limit_reached && depart.is_some() {
-        let location = depart.unwrap();
-        let (enabled, choices) = locations(a).await?;
-        if !enabled || !choices.iter().any(|l| l.id == location) {
+        let requested = depart.unwrap();
+        let (enabled, choices) = api.locations().await?;
+        if !enabled {
             report.skipped += 1;
+            report.errors.push("旅行活动未开放，已跳过出发".into());
             return Ok(report);
         }
+        let location = if automatic && requested == 0 {
+            match random_location(&choices) {
+                Some(id) => id,
+                None => {
+                    report.skipped += 1;
+                    report
+                        .errors
+                        .push("官方未提供可用旅行目的地，已跳过出发".into());
+                    return Ok(report);
+                }
+            }
+        } else {
+            if requested <= 0 || !choices.iter().any(|l| l.id == requested) {
+                report.skipped += 1;
+                report
+                    .errors
+                    .push("所选旅行目的地不可用，已跳过出发".into());
+                return Ok(report);
+            }
+            requested
+        };
         let date = chrono::Utc::now()
             .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
             .format("%Y-%m-%d")
@@ -305,7 +371,7 @@ pub(crate) async fn run_locked(
     if journal.operations.len() >= 4096 {
         return Err("活动操作记录超限".into());
     }
-    if automatic && !super::growth_schedule::allows_travel(id, action, depart)? {
+    if automatic && !super::growth_schedule::allows_travel_at(root, id, action, depart)? {
         return Ok(report);
     }
     journal.operations.insert(
@@ -322,9 +388,9 @@ pub(crate) async fn run_locked(
         },
     );
     growth_automation::save_journal(root, &journal)?;
-    let submitted = request(a, action, Some(body)).await;
+    let submitted = api.submit(action, body).await;
     persist_receipt(root, &mut journal, &k, submitted.is_ok())?;
-    let after = status(a).await;
+    let after = api.status().await;
     let op = journal.operations.get_mut(&k).unwrap();
     if after.as_ref().is_ok_and(|s| verified(op, s)) {
         op.state = OperationState::Verified;
@@ -391,6 +457,144 @@ async fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct FakeTravel {
+        state: std::sync::Mutex<TravelState>,
+        choices: Vec<Location>,
+        enabled: bool,
+        fail_query: bool,
+        uncertain: bool,
+        submits: std::sync::atomic::AtomicUsize,
+    }
+    impl TravelApi for FakeTravel {
+        fn status(&self) -> TravelFuture<'_, TravelState> {
+            Box::pin(async { Ok(self.state.lock().unwrap().clone()) })
+        }
+        fn locations(&self) -> TravelFuture<'_, (bool, Vec<Location>)> {
+            Box::pin(async {
+                if self.fail_query {
+                    Err("fixture query failed".into())
+                } else {
+                    Ok((self.enabled, self.choices.clone()))
+                }
+            })
+        }
+        fn submit<'a>(&'a self, _: &'a str, body: Value) -> TravelFuture<'a, ()> {
+            Box::pin(async move {
+                self.submits
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.uncertain {
+                    return Err("fixture timeout".into());
+                }
+                let mut state = self.state.lock().unwrap();
+                state.state = "traveling".into();
+                state.record_id = Some(42);
+                state.location_id = body["location_id"].as_i64();
+                state.depart_at = Some(config::now_ms());
+                state.daily_limit_reached = true;
+                Ok(())
+            })
+        }
+    }
+    #[tokio::test]
+    async fn random_departure_persists_concrete_location_and_never_replays_unknown_or_verified() {
+        for uncertain in [true, false] {
+            let root = std::env::temp_dir().join(format!("random-travel-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let cfg = json!({"version":1,"enabled":true,"auto_claim":false,"account_ids":["fixture"],"daily_time":"09:30","travel_claim":false,"travel_depart":true,"travel_location_id":0});
+            std::fs::write(root.join("growth_config.json"), cfg.to_string()).unwrap();
+            let a = json!({"id":"fixture","uid":"fictional","region":"cn"});
+            let api = FakeTravel {
+                state: std::sync::Mutex::new(TravelState {
+                    account_id: "fixture".into(),
+                    state: "idle".into(),
+                    daily_limit_reached: false,
+                    record_id: None,
+                    location_id: None,
+                    depart_at: None,
+                    arrive_at: None,
+                }),
+                choices: vec![
+                    Location {
+                        id: 3,
+                        name: "test".into(),
+                    },
+                    Location {
+                        id: 7,
+                        name: "test".into(),
+                    },
+                ],
+                enabled: true,
+                fail_query: false,
+                uncertain,
+                submits: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let first = run_with(&root, &a, false, Some(0), true, &api)
+                .await
+                .unwrap();
+            assert_eq!(first.awaiting_verification, usize::from(uncertain));
+            let journal = growth_automation::read_journal(&root).unwrap();
+            assert_eq!(journal.operations.len(), 1);
+            let op = journal.operations.values().next().unwrap();
+            assert!(["travel_depart:3", "travel_depart:7"].contains(&op.task_code.as_str()));
+            run_with(&root, &a, false, Some(0), true, &api)
+                .await
+                .unwrap();
+            assert_eq!(api.submits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn random_departure_skips_empty_closed_failed_or_disabled_without_submission() {
+        for case in 0..5 {
+            let root = std::env::temp_dir().join(format!("random-skip-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let cfg = json!({"version":1,"enabled":case!=3,"auto_claim":false,"account_ids":["fixture"],"daily_time":"09:30","travel_claim":false,"travel_depart":true,"travel_location_id":0});
+            std::fs::write(root.join("growth_config.json"), cfg.to_string()).unwrap();
+            let a = json!({"id":"fixture","uid":"fictional","region":"cn"});
+            let api = FakeTravel {
+                state: std::sync::Mutex::new(TravelState {
+                    account_id: "fixture".into(),
+                    state: "idle".into(),
+                    daily_limit_reached: case == 4,
+                    record_id: None,
+                    location_id: None,
+                    depart_at: None,
+                    arrive_at: None,
+                }),
+                choices: if case == 0 {
+                    vec![]
+                } else {
+                    vec![Location {
+                        id: 3,
+                        name: "test".into(),
+                    }]
+                },
+                enabled: case != 1,
+                fail_query: case == 2,
+                uncertain: false,
+                submits: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let _ = run_with(&root, &a, false, Some(0), true, &api).await;
+            assert_eq!(api.submits.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(growth_automation::read_journal(&root)
+                .unwrap()
+                .operations
+                .is_empty());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn random_selection_never_uses_invalid_or_unoffered_locations() {
+        let loc = |id| Location {
+            id,
+            name: String::new(),
+        };
+        assert_eq!(random_location(&[loc(0), loc(-1)]), None);
+        assert_eq!(random_location(&[loc(3), loc(3), loc(0)]), Some(3));
+        for _ in 0..100 {
+            assert!([3, 7].contains(&random_location(&[loc(3), loc(7), loc(-1)]).unwrap()));
+        }
+    }
     #[test]
     fn unknown_and_incomplete_states_do_not_authorize_writes() {
         for v in [
